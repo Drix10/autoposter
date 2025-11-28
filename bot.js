@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const ffmpeg = require("fluent-ffmpeg");
 const delay = require("delay");
+const geminiService = require("./gemini-service");
 
 function logToDiscord(channel, message, type = "info") {
   const icons = {
@@ -52,6 +53,14 @@ if (!GITHUB_CONFIG.token || !GITHUB_CONFIG.owner || !GITHUB_CONFIG.repo) {
   console.warn("⚠️ GitHub configuration incomplete - uploads will fail");
 }
 
+if (!process.env.GEMINI_API_KEY) {
+  console.warn("⚠️ GEMINI_API_KEY not set - AI captions will be disabled");
+  console.warn("   Add GEMINI_API_KEY to .env to enable AI-powered captions");
+  console.warn(
+    "   Get your free API key from: https://aistudio.google.com/app/apikey"
+  );
+}
+
 const BASE_CAPTION =
   "@idolchat.app is better than c.ai / chai\n\nNot only can you chat with your AI characters but you can collect other's characters, style them, trade them as a card game through a multiplayer experience.\n\nIdol Chat turns these characters into unique collectibles that you can earn, customize, upgrade, trade, and more!\n\n─── ⋆⋅☆⋅⋆ ──✨── ⋆⋅☆⋅⋆ ───\n\n🎬 Yoinked from: @%author% (DM for removal)\n💭 Original Caption:\n\n%originalCaption%";
 
@@ -71,6 +80,50 @@ const RETRY_CONFIG = {
   baseDelay: 15000,
   maxDelay: 120000,
   backoffMultiplier: 2,
+};
+
+// Timing constants to avoid magic numbers
+const DELAYS = {
+  BETWEEN_ACCOUNTS: 30000, // 30 seconds between Instagram account uploads
+  BETWEEN_YOUTUBE: 10000, // 10 seconds between YouTube uploads
+  RANDOM_MIN: 2000, // Minimum random delay
+  RANDOM_MAX: 5000, // Maximum random delay
+  RANDOM_LARGE_MIN: 5000, // Larger random delay min
+  RANDOM_LARGE_MAX: 8000, // Larger random delay max
+  COMMENT_DELAY_MIN: 5000, // Min delay before posting comment
+  COMMENT_DELAY_MAX: 8000, // Max delay before posting comment
+  RATE_LIMIT_WAIT: 60000, // 1 minute wait for rate limits
+  CONTAINER_CHECK: 5000, // Base delay for checking container status
+  CONTAINER_CHECK_RANDOM: 8000, // Random addition to container check
+  PUBLISH_DELAY_MIN: 5000, // Min delay before publishing
+  PUBLISH_DELAY_MAX: 10000, // Max delay before publishing
+  DOWNLOAD_RETRY: 5000, // Delay between download retries
+  API_RETRY: 10000, // Delay between API retries
+  BACKOFF_BASE: 30000, // Base backoff delay (30s)
+};
+
+// Timeout constants
+const TIMEOUTS = {
+  AXIOS_DEFAULT: 30000, // 30 seconds
+  AXIOS_DOWNLOAD: 60000, // 60 seconds for video downloads
+  DOWNLOAD_TOTAL: 120000, // 2 minutes total download timeout
+  CAPTION_EXTRACTION: 20000, // 20 seconds for caption extraction
+  OEMBED_API: 8000, // 8 seconds for oEmbed API
+  ALT_API: 8000, // 8 seconds for alternative API
+  SCRAPING: 10000, // 10 seconds for web scraping
+  GITHUB_UPLOAD: 120000, // 2 minutes for GitHub upload
+  YOUTUBE_API: 15000, // 15 seconds for YouTube API calls
+  YOUTUBE_UPLOAD: 30000, // 30 seconds for YouTube upload
+  INSTAGRAM_API: 30000, // 30 seconds for Instagram API
+  INSTAGRAM_STATUS: 15000, // 15 seconds for status checks
+};
+
+// File size limits
+const FILE_LIMITS = {
+  MIN_VIDEO_SIZE: 1024, // 1KB minimum
+  GITHUB_MAX_MB: 70, // 70MB for GitHub (accounting for base64 overhead)
+  YOUTUBE_MAX_GB: 128, // 128GB for YouTube (unverified accounts)
+  INSTAGRAM_CAPTION_MAX: 2200, // Instagram caption character limit
 };
 
 client.once("ready", () => {
@@ -361,6 +414,98 @@ client.on("messageCreate", async (message) => {
     const githubVideoUrl = await uploadToGitHub(message.channel, finalPath);
     const githubStoryUrl = githubVideoUrl; // Use same video for story
 
+    // Generate AI captions ONCE for all accounts - OPTIMIZED!
+    // Upload video once and reuse for both Instagram and YouTube
+    let aiGeneratedCaption = null;
+    let ytTitle = null;
+    let ytDescription = null;
+
+    if (!isRepost) {
+      let geminiVideoFile = null;
+
+      try {
+        // Step 1: Upload video to Gemini ONCE
+        await logToDiscord(
+          message.channel,
+          `📹 Uploading video to AI for analysis...`,
+          "info"
+        );
+
+        geminiVideoFile = await geminiService.uploadVideoForAnalysis(finalPath);
+        console.log(`✅ Video uploaded to Gemini: ${geminiVideoFile.name}`);
+
+        // Step 2: Generate Instagram caption using uploaded video
+        await logToDiscord(
+          message.channel,
+          `🤖 Generating Instagram caption...`,
+          "info"
+        );
+
+        aiGeneratedCaption =
+          await geminiService.generateInstagramCaptionWithFile(
+            originalCaption,
+            author,
+            originalHashtags,
+            geminiVideoFile
+          );
+
+        console.log(
+          `✨ Instagram caption generated (${
+            aiGeneratedCaption.length
+          } chars): ${aiGeneratedCaption.substring(0, 100)}...`
+        );
+
+        // Step 3: Generate YouTube metadata using SAME uploaded video
+        if (YOUTUBE_ACCOUNTS.length > 0) {
+          await logToDiscord(
+            message.channel,
+            `🤖 Generating YouTube metadata...`,
+            "info"
+          );
+
+          const ytMetadata =
+            await geminiService.generateYouTubeMetadataWithFile(
+              originalCaption,
+              author,
+              originalHashtags,
+              geminiVideoFile
+            );
+
+          ytTitle = ytMetadata.title;
+          ytDescription = ytMetadata.description;
+
+          console.log(`✨ YouTube metadata generated:`);
+          console.log(`   Title: ${ytTitle}`);
+          console.log(`   Description: ${ytDescription.substring(0, 100)}...`);
+        }
+
+        // Step 4: Clean up uploaded video file
+        await geminiService.cleanupVideoFile(geminiVideoFile.name);
+        console.log(`🧹 Cleaned up Gemini video file`);
+      } catch (error) {
+        console.error("Failed to generate AI captions:", error);
+        await logToDiscord(
+          message.channel,
+          `⚠️ AI caption generation failed: ${error.message}`,
+          "warning"
+        );
+        await logToDiscord(
+          message.channel,
+          `Using fallback captions for all accounts`,
+          "info"
+        );
+
+        // Clean up video file if it was uploaded
+        if (geminiVideoFile) {
+          try {
+            await geminiService.cleanupVideoFile(geminiVideoFile.name);
+          } catch (cleanupError) {
+            console.error("Failed to cleanup video file:", cleanupError);
+          }
+        }
+      }
+    }
+
     let completedUploads = 0;
     const totalUploads = ACCOUNTS.length;
 
@@ -391,7 +536,8 @@ client.on("messageCreate", async (message) => {
           originalHashtags,
           message.channel,
           originalCaption,
-          isRepost
+          isRepost,
+          aiGeneratedCaption // Pass the pre-generated caption
         );
         completedUploads++;
       } catch (error) {
@@ -406,12 +552,27 @@ client.on("messageCreate", async (message) => {
           "info"
         );
       }
-      await delay(30000);
+      await delay(DELAYS.BETWEEN_ACCOUNTS);
     }
 
     // Upload to YouTube accounts
     let completedYouTubeUploads = 0;
     const totalYouTubeUploads = YOUTUBE_ACCOUNTS.length;
+
+    // YouTube metadata already generated above (reusing same video upload)
+    // Set fallback if not generated
+    if (!ytTitle && YOUTUBE_ACCOUNTS.length > 0) {
+      ytTitle = `${author} | K-drama/K-pop Content | idolchat.app`;
+      ytDescription =
+        isRepost && originalCaption
+          ? originalCaption
+          : `${BASE_CAPTION.replace("%author%", author).replace(
+              "%originalCaption%",
+              originalCaption || "No caption available"
+            )}`;
+    }
+
+    const ytTags = ["kpop", "kdrama", "idolchat", "viral", "trending", author];
 
     for (let ytAccount of YOUTUBE_ACCOUNTS) {
       try {
@@ -430,23 +591,6 @@ client.on("messageCreate", async (message) => {
           ],
           0xff0000
         );
-
-        const ytTitle = `${author} | K-drama/K-pop Content | idolchat.app`;
-        const ytDescription =
-          isRepost && originalCaption
-            ? originalCaption
-            : `${BASE_CAPTION.replace("%author%", author).replace(
-                "%originalCaption%",
-                originalCaption || "No caption available"
-              )}`;
-        const ytTags = [
-          "kpop",
-          "kdrama",
-          "idolchat",
-          "viral",
-          "trending",
-          author,
-        ];
 
         await uploadToYouTube(
           ytAccount,
@@ -469,7 +613,7 @@ client.on("messageCreate", async (message) => {
           "info"
         );
       }
-      await delay(10000); // 10 second delay between YouTube uploads
+      await delay(DELAYS.BETWEEN_YOUTUBE); // Delay between YouTube uploads
     }
 
     try {
@@ -496,17 +640,24 @@ client.on("messageCreate", async (message) => {
         console.error(`Error reading videos directory:`, dirError.message);
       }
 
-      for (const file of filesToClean) {
+      // Use Set to avoid duplicate file paths
+      const uniqueFiles = [...new Set(filesToClean)];
+
+      for (const file of uniqueFiles) {
         try {
+          // Double-check existence before deletion to avoid race conditions
           if (fs.existsSync(file)) {
             fs.unlinkSync(file);
             console.log(`🧹 Cleaned up: ${path.basename(file)}`);
           }
         } catch (error) {
-          console.error(
-            `Failed to delete ${path.basename(file)}:`,
-            error.message
-          );
+          // Ignore ENOENT errors (file already deleted)
+          if (error.code !== "ENOENT") {
+            console.error(
+              `Failed to delete ${path.basename(file)}:`,
+              error.message
+            );
+          }
         }
       }
       console.log(`🧹 Cleanup completed for session: ${sessionId}`);
@@ -653,7 +804,7 @@ async function downloadReel(
 
   try {
     const response = await axios.get(API_URL, {
-      timeout: 30000,
+      timeout: TIMEOUTS.AXIOS_DEFAULT,
       maxRedirects: 5,
     });
 
@@ -674,12 +825,11 @@ async function downloadReel(
       console.log(`� Extracting original caption for session: ${sessionId}`);
 
       const captionPromise = extractInstagramCaption(instagramUrl, sessionId);
-      const timeoutPromise = new Promise(
-        (_, reject) =>
-          setTimeout(
-            () => reject(new Error("Caption extraction timeout")),
-            20000
-          ) // 20 second timeout
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("Caption extraction timeout")),
+          TIMEOUTS.CAPTION_EXTRACTION
+        )
       );
 
       const captionData = await Promise.race([captionPromise, timeoutPromise]);
@@ -689,8 +839,13 @@ async function downloadReel(
           .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
           .trim();
 
+        // Truncate at word boundary to avoid cutting mid-word
         if (originalCaption.length > 600) {
-          originalCaption = originalCaption.substring(0, 597) + "...";
+          const truncated = originalCaption.substring(0, 597);
+          const lastSpace = truncated.lastIndexOf(" ");
+          originalCaption =
+            (lastSpace > 500 ? truncated.substring(0, lastSpace) : truncated) +
+            "...";
         }
 
         // Store the extracted hashtags
@@ -721,7 +876,7 @@ async function downloadReel(
     const writer = fs.createWriteStream(videoPath);
     const videoResponse = await axios.get(videoUrl, {
       responseType: "stream",
-      timeout: 60000, // 60 second timeout
+      timeout: TIMEOUTS.AXIOS_DOWNLOAD,
       maxContentLength: 100 * 1024 * 1024, // 100MB max
       validateStatus: (status) => status === 200, // Only accept 200 status
     });
@@ -734,15 +889,24 @@ async function downloadReel(
 
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
-        writer.destroy();
+        try {
+          writer.destroy();
+        } catch (e) {}
+        try {
+          videoResponse.data.destroy(); // Also destroy response stream
+        } catch (e) {}
         fs.unlink(videoPath, () => {}); // Clean up partial file
         reject(new Error(`Download timeout for session ${sessionId}`));
-      }, 120000); // 2 minute total timeout
+      }, TIMEOUTS.DOWNLOAD_TOTAL);
 
       writer.on("error", (err) => {
         clearTimeout(timeout);
-        writer.destroy(); // Properly close the stream
-        videoResponse.data.destroy(); // Close the response stream
+        try {
+          writer.destroy(); // Properly close the stream
+        } catch (e) {}
+        try {
+          videoResponse.data.destroy(); // Close the response stream
+        } catch (e) {}
         fs.unlink(videoPath, () => {});
         reject(new Error(`Video write error: ${err.message}`));
       });
@@ -752,20 +916,56 @@ async function downloadReel(
 
         // Verify file size
         const stats = fs.statSync(videoPath);
-        if (stats.size < 1024) {
+        if (stats.size < FILE_LIMITS.MIN_VIDEO_SIZE) {
           // Less than 1KB is definitely invalid
-          writer.destroy();
+          try {
+            writer.destroy();
+          } catch (e) {}
           fs.unlink(videoPath, () => {});
           reject(new Error("Downloaded file is too small to be a valid video"));
           return;
         }
 
-        console.log(`Downloaded reel for session: ${sessionId}`);
-        resolve({
-          videoPath,
-          originalCaption,
-          originalHashtags,
-          isRepost,
+        // Validate video file with ffprobe
+        ffmpeg.ffprobe(videoPath, (err, metadata) => {
+          if (
+            err ||
+            !metadata ||
+            !metadata.streams ||
+            metadata.streams.length === 0
+          ) {
+            console.error(
+              `Invalid video file for session ${sessionId}:`,
+              err?.message || "No streams found"
+            );
+            try {
+              writer.destroy();
+            } catch (e) {}
+            fs.unlink(videoPath, () => {});
+            reject(new Error("Downloaded file is not a valid video"));
+            return;
+          }
+
+          const hasVideo = metadata.streams.some(
+            (s) => s.codec_type === "video"
+          );
+          if (!hasVideo) {
+            console.error(`No video stream found for session ${sessionId}`);
+            try {
+              writer.destroy();
+            } catch (e) {}
+            fs.unlink(videoPath, () => {});
+            reject(new Error("Downloaded file has no video stream"));
+            return;
+          }
+
+          console.log(`Downloaded reel for session: ${sessionId}`);
+          resolve({
+            videoPath,
+            originalCaption,
+            originalHashtags,
+            isRepost,
+          });
         });
       });
     });
@@ -789,14 +989,17 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
 
     const oembedResponse = await Promise.race([
       axios.get(oembedUrl, {
-        timeout: 8000,
+        timeout: TIMEOUTS.OEMBED_API,
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         },
       }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("oEmbed timeout")), 8000)
+        setTimeout(
+          () => reject(new Error("oEmbed timeout")),
+          TIMEOUTS.OEMBED_API
+        )
       ),
     ]);
 
@@ -830,7 +1033,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
 
     const altResponse = await Promise.race([
       axios.get(altApiUrl, {
-        timeout: 8000,
+        timeout: TIMEOUTS.ALT_API,
         headers: {
           "User-Agent":
             "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
@@ -839,7 +1042,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
         },
       }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Alt API timeout")), 8000)
+        setTimeout(() => reject(new Error("Alt API timeout")), TIMEOUTS.ALT_API)
       ),
     ]);
 
@@ -867,7 +1070,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
 
     const response = await Promise.race([
       axios.get(instagramUrl, {
-        timeout: 10000,
+        timeout: TIMEOUTS.SCRAPING,
         headers: {
           "User-Agent":
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
@@ -879,7 +1082,10 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
         },
       }),
       new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Scraping timeout")), 10000)
+        setTimeout(
+          () => reject(new Error("Scraping timeout")),
+          TIMEOUTS.SCRAPING
+        )
       ),
     ]);
 
@@ -1227,11 +1433,6 @@ async function stripAllMetadata(videoPath, sessionId) {
         resolve(cleanedPath);
       })
       .on("error", (err) => {
-        try {
-          this.kill("SIGKILL"); // Kill FFmpeg process to prevent leak
-        } catch (killError) {
-          console.error("Failed to kill FFmpeg process:", killError.message);
-        }
         console.error(
           `❌ Metadata stripping failed for session ${sessionId}:`,
           err.message
@@ -1441,11 +1642,6 @@ async function processVideo(videoPath, sessionId) {
           resolve(editedPath);
         })
         .on("error", (err) => {
-          try {
-            command.kill("SIGKILL"); // Kill FFmpeg process to prevent leak
-          } catch (killError) {
-            console.error("Failed to kill FFmpeg process:", killError.message);
-          }
           console.error(
             `Video processing failed for session ${sessionId}:`,
             err.message
@@ -1486,14 +1682,12 @@ async function uploadToGitHub(channel, filePath) {
     const fileSizeMB = stats.size / (1024 * 1024);
 
     // GitHub API limit is 100MB, but base64 encoding adds ~33% overhead
-    // So practical limit is around 75MB for the original file
-    const MAX_FILE_SIZE_MB = 75;
-
-    if (fileSizeMB > MAX_FILE_SIZE_MB) {
+    // So practical limit is around 70MB for the original file to ensure encoded size < 100MB
+    if (fileSizeMB > FILE_LIMITS.GITHUB_MAX_MB) {
       throw new Error(
-        `File too large (${fileSizeMB.toFixed(
-          2
-        )}MB). GitHub API limit is ${MAX_FILE_SIZE_MB}MB. Consider using Git LFS or alternative storage.`
+        `File too large (${fileSizeMB.toFixed(2)}MB). GitHub API limit is ${
+          FILE_LIMITS.GITHUB_MAX_MB
+        }MB (accounting for base64 encoding overhead). Consider using Git LFS or alternative storage.`
       );
     }
 
@@ -1523,11 +1717,11 @@ async function uploadToGitHub(channel, filePath) {
       branch: "main",
     });
 
-    // Add a reasonable timeout (2 minutes for large files)
+    // Add a reasonable timeout for large files
     const timeoutPromise = new Promise((_, reject) =>
       setTimeout(
         () => reject(new Error("Upload timeout after 2 minutes")),
-        120000
+        TIMEOUTS.GITHUB_UPLOAD
       )
     );
 
@@ -1640,6 +1834,40 @@ async function uploadToYouTube(
       "info"
     );
 
+    // Validate and truncate title (YouTube limit: 100 characters) at word boundary
+    if (title.length > 100) {
+      const truncated = title.substring(0, 97);
+      const lastSpace = truncated.lastIndexOf(" ");
+      title =
+        (lastSpace > 80 ? truncated.substring(0, lastSpace) : truncated) +
+        "...";
+      console.log(`YouTube title truncated to 100 characters`);
+    }
+
+    // Validate and truncate description (YouTube limit: 5000 characters) at word boundary
+    if (description.length > 5000) {
+      const truncated = description.substring(0, 4997);
+      const lastSpace = truncated.lastIndexOf(" ");
+      description =
+        (lastSpace > 4900 ? truncated.substring(0, lastSpace) : truncated) +
+        "...";
+      console.log(`YouTube description truncated to 5000 characters`);
+    }
+
+    // Validate tags (YouTube limits: max 500 characters total, 30 characters per tag)
+    if (tags && tags.length > 0) {
+      tags = tags
+        .map((tag) => (tag.length > 30 ? tag.substring(0, 30) : tag))
+        .filter((tag) => tag.length > 0);
+
+      // Ensure total tags length doesn't exceed 500 characters
+      let totalLength = tags.join(",").length;
+      while (totalLength > 500 && tags.length > 0) {
+        tags.pop();
+        totalLength = tags.join(",").length;
+      }
+    }
+
     const { google } = await import("googleapis");
 
     const oauth2Client = new google.auth.OAuth2(
@@ -1671,6 +1899,17 @@ async function uploadToYouTube(
 
     const fileSize = fs.statSync(videoPath).size;
     const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
+    const fileSizeGB = fileSize / (1024 * 1024 * 1024);
+
+    // YouTube limits: 256GB for verified accounts, 128GB for unverified
+    // Most users are unverified, so we'll use the conservative limit
+    if (fileSizeGB > FILE_LIMITS.YOUTUBE_MAX_GB) {
+      throw new Error(
+        `Video file too large (${fileSizeGB.toFixed(2)}GB). YouTube limit is ${
+          FILE_LIMITS.YOUTUBE_MAX_GB
+        }GB for unverified accounts.`
+      );
+    }
 
     await logToDiscord(
       channel,
@@ -1745,7 +1984,8 @@ async function postToInstagram(
   channel,
   originalCaption = "",
   isRepost = false,
-  maxRetries = 3
+  maxRetries = 3,
+  preGeneratedCaption = null // NEW: Accept pre-generated AI caption
 ) {
   let attempt = 0;
   let lastError = null;
@@ -1839,6 +2079,13 @@ async function postToInstagram(
             "info"
           );
         } catch (downloadError) {
+          // Clean up partial file and destroy stream
+          try {
+            if (writer) writer.destroy();
+          } catch (e) {}
+          try {
+            if (videoResponse?.data) videoResponse.data.destroy();
+          } catch (e) {}
           if (fs.existsSync(localVideoPath)) {
             fs.unlinkSync(localVideoPath);
           }
@@ -1860,7 +2107,13 @@ async function postToInstagram(
       let caption;
       if (isRepost && originalCaption) {
         caption = originalCaption;
+      } else if (preGeneratedCaption) {
+        // Use pre-generated AI caption (generated once for all accounts)
+        caption = preGeneratedCaption;
+        console.log(`Using pre-generated AI caption for ${account.name}`);
       } else {
+        // Fallback to basic caption if AI generation failed
+        console.log(`Using fallback caption for ${account.name}`);
         caption =
           BASE_CAPTION.replace("%author%", author).replace(
             "%originalCaption%",
@@ -1870,12 +2123,12 @@ async function postToInstagram(
           generateHashtags().join(" ");
       }
 
-      // Instagram caption length limit is 2200 characters
-      const MAX_CAPTION_LENGTH = 2200;
-      if (caption.length > MAX_CAPTION_LENGTH) {
-        caption = caption.substring(0, MAX_CAPTION_LENGTH - 3) + "...";
+      // Instagram caption length limit
+      if (caption.length > FILE_LIMITS.INSTAGRAM_CAPTION_MAX) {
+        caption =
+          caption.substring(0, FILE_LIMITS.INSTAGRAM_CAPTION_MAX - 3) + "...";
         console.log(
-          `⚠️ Caption truncated to ${MAX_CAPTION_LENGTH} chars for ${account.name}`
+          `⚠️ Caption truncated to ${FILE_LIMITS.INSTAGRAM_CAPTION_MAX} chars for ${account.name}`
         );
       }
 
@@ -2134,6 +2387,7 @@ function isNonRetryableError(error) {
   const errorMessage =
     error.response?.data?.error?.message || error.message || "";
   const statusCode = error.response?.status;
+  const errorCode = error.code;
 
   // Don't retry on authentication/authorization errors
   if (statusCode === 401 || statusCode === 403) {
@@ -2165,16 +2419,46 @@ function isNonRetryableError(error) {
     return true;
   }
 
+  // Don't retry on unrecoverable network errors
+  if (
+    errorCode === "ENOTFOUND" ||
+    errorCode === "ECONNREFUSED" ||
+    errorCode === "EHOSTUNREACH" ||
+    errorCode === "ENETUNREACH"
+  ) {
+    return true;
+  }
+
   return false;
 }
 
 function generateRandomDeviceId() {
-  const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  for (let i = 0; i < 16; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
+  // Use crypto for better randomness and avoid collisions
+  const crypto = require("crypto");
+  return crypto.randomBytes(8).toString("hex"); // 16 hex characters
 }
+
+// Graceful shutdown handlers
+process.on("SIGINT", async () => {
+  console.log("\n🛑 Shutting down gracefully...");
+  try {
+    await geminiService.cleanup();
+    console.log("✅ Cleanup complete");
+  } catch (error) {
+    console.error("❌ Cleanup error:", error);
+  }
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("\n🛑 Shutting down gracefully...");
+  try {
+    await geminiService.cleanup();
+    console.log("✅ Cleanup complete");
+  } catch (error) {
+    console.error("❌ Cleanup error:", error);
+  }
+  process.exit(0);
+});
 
 client.login(DISCORD_TOKEN);

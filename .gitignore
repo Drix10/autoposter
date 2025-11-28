@@ -1,0 +1,23 @@
+# Environment variables
+.env
+
+# Node modules
+node_modules/
+
+# Video files
+videos/
+*.mp4
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo

@@ -5,6 +5,8 @@ const {
 } = require("@google/generative-ai");
 const { GoogleAIFileManager } = require("@google/generative-ai/server");
 const fs = require("fs");
+const path = require("path");
+const ffmpeg = require("fluent-ffmpeg");
 require("dotenv").config();
 
 // Validate API key on startup
@@ -23,6 +25,7 @@ const genAI = process.env.GEMINI_API_KEY
 const MAX_VIDEO_PROCESSING_TIME_MS = 60000; // 60 seconds
 const VIDEO_PROCESSING_CHECK_INTERVAL_MS = 2000; // 2 seconds
 const MAX_VIDEO_SIZE_MB = 20; // Gemini free tier limit
+const TRIM_VIDEO_DURATION = 10; // Trim to first 10 seconds for AI analysis
 const RATE_LIMIT_RPM = 10; // Conservative limit
 const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute
 const MAX_CAPTION_LENGTH = 500;
@@ -231,12 +234,63 @@ class GeminiCaptionService {
     }
 
     let videoFile = null;
+    let trimmedPath = null;
+    let shouldCleanupTrimmed = false;
+
     try {
-      videoFile = await this.uploadFileToGemini(videoPath);
+      // Validate input file exists
+      if (!fs.existsSync(videoPath)) {
+        throw new Error(`Video file not found: ${videoPath}`);
+      }
+
+      // Check file size first
+      const stats = fs.statSync(videoPath);
+      const fileSizeMB = stats.size / (1024 * 1024);
+
+      // If video is too large, trim to first 10 seconds
+      if (fileSizeMB > MAX_VIDEO_SIZE_MB) {
+        console.log(
+          `📹 Video too large (${fileSizeMB.toFixed(
+            2
+          )}MB), trimming to first ${TRIM_VIDEO_DURATION} seconds...`
+        );
+        trimmedPath = await this.trimVideoForAnalysis(videoPath);
+        shouldCleanupTrimmed = true;
+
+        // Validate trimmed file was created and is smaller
+        if (!fs.existsSync(trimmedPath)) {
+          throw new Error("Trimmed video file was not created");
+        }
+
+        const trimmedStats = fs.statSync(trimmedPath);
+        const trimmedSizeMB = trimmedStats.size / (1024 * 1024);
+
+        if (trimmedSizeMB > MAX_VIDEO_SIZE_MB) {
+          throw new Error(
+            `Trimmed video still too large (${trimmedSizeMB.toFixed(2)}MB)`
+          );
+        }
+
+        console.log(`✅ Trimmed video size: ${trimmedSizeMB.toFixed(2)}MB`);
+        videoFile = await this.uploadFileToGemini(trimmedPath);
+      } else {
+        videoFile = await this.uploadFileToGemini(videoPath);
+      }
+
       this.uploadedFiles.add(videoFile.name);
 
       // Wait for processing
       const processedFile = await this.waitForVideoProcessing(videoFile.name);
+
+      // Only clean up trimmed file AFTER successful processing
+      if (shouldCleanupTrimmed && trimmedPath && fs.existsSync(trimmedPath)) {
+        try {
+          fs.unlinkSync(trimmedPath);
+          console.log(`🧹 Cleaned up trimmed video`);
+        } catch (e) {
+          console.warn(`Warning: Could not delete trimmed video: ${e.message}`);
+        }
+      }
 
       return processedFile;
     } catch (error) {
@@ -244,6 +298,17 @@ class GeminiCaptionService {
       if (videoFile && videoFile.name) {
         this.uploadedFiles.delete(videoFile.name);
       }
+
+      // Clean up trimmed file on error
+      if (shouldCleanupTrimmed && trimmedPath && fs.existsSync(trimmedPath)) {
+        try {
+          fs.unlinkSync(trimmedPath);
+          console.log(`🧹 Cleaned up trimmed video (error cleanup)`);
+        } catch (e) {
+          console.warn(`Warning: Could not delete trimmed video: ${e.message}`);
+        }
+      }
+
       throw error;
     }
   }
@@ -395,6 +460,124 @@ Generate ONLY the caption text, nothing else. No explanations, no quotes around 
 
   getFallbackYouTubeDescription(originalCaption, author) {
     return `Check out idolchat.app - the ultimate AI character chat platform! Better than c.ai and chai, you can chat, collect, style, and trade characters in a multiplayer experience.\n\nCredit: @${author}\n\n#kpop #kdrama #idolchat #viral #trending`;
+  }
+
+  /**
+   * Trim video to first N seconds for AI analysis
+   */
+  async trimVideoForAnalysis(videoPath) {
+    return new Promise((resolve, reject) => {
+      const timestamp = Date.now();
+      const trimmedPath = path.join(
+        path.dirname(videoPath),
+        `trimmed_ai_${timestamp}.mp4`
+      );
+
+      let command = null;
+      let timeoutId = null;
+      let resolved = false;
+
+      console.log(
+        `✂️ Trimming video to ${TRIM_VIDEO_DURATION} seconds for AI analysis...`
+      );
+
+      // Timeout protection (2 minutes max)
+      timeoutId = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          console.error(`❌ Video trimming timeout after 2 minutes`);
+
+          // Kill FFmpeg process
+          if (command) {
+            try {
+              command.kill("SIGKILL");
+            } catch (e) {
+              console.error(`Failed to kill FFmpeg: ${e.message}`);
+            }
+          }
+
+          // Clean up partial file
+          if (fs.existsSync(trimmedPath)) {
+            try {
+              fs.unlinkSync(trimmedPath);
+            } catch (e) {}
+          }
+
+          reject(new Error("Video trimming timeout"));
+        }
+      }, 120000); // 2 minutes
+
+      try {
+        command = ffmpeg(videoPath)
+          .setStartTime(0)
+          .setDuration(TRIM_VIDEO_DURATION)
+          .outputOptions([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28", // Higher CRF for smaller file
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+          ])
+          .output(trimmedPath)
+          .on("end", () => {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timeoutId);
+
+              // Validate output file
+              if (!fs.existsSync(trimmedPath)) {
+                reject(new Error("Trimmed file was not created"));
+                return;
+              }
+
+              const stats = fs.statSync(trimmedPath);
+              if (stats.size < 1024) {
+                // Less than 1KB
+                try {
+                  fs.unlinkSync(trimmedPath);
+                } catch (e) {}
+                reject(new Error("Trimmed file is too small (corrupted)"));
+                return;
+              }
+
+              const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+              console.log(`✅ Trimmed video created: ${sizeMB}MB`);
+              resolve(trimmedPath);
+            }
+          })
+          .on("error", (err) => {
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timeoutId);
+              console.error(`❌ Video trimming failed: ${err.message}`);
+
+              // Clean up partial file
+              if (fs.existsSync(trimmedPath)) {
+                try {
+                  fs.unlinkSync(trimmedPath);
+                } catch (e) {}
+              }
+
+              reject(new Error(`Failed to trim video: ${err.message}`));
+            }
+          });
+
+        command.run();
+      } catch (error) {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timeoutId);
+          reject(error);
+        }
+      }
+    });
   }
 
   async checkRateLimit() {

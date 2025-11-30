@@ -699,6 +699,17 @@ client.on("messageCreate", async (message) => {
                   return false;
                 }
               }
+              // Clean orphaned trimmed_ai_ files older than 10 minutes
+              if (f.startsWith("trimmed_ai_")) {
+                try {
+                  const filePath = path.join(videosDir, f);
+                  const stats = fs.statSync(filePath);
+                  const ageMs = now - stats.mtimeMs;
+                  return ageMs > 600000; // 10 minutes
+                } catch (e) {
+                  return false;
+                }
+              }
               return false;
             })
             .map((f) => path.join(videosDir, f));

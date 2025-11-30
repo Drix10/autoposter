@@ -16,7 +16,16 @@ function logToDiscord(channel, message, type = "info") {
     process: "⚙️",
   };
 
-  return channel.send(`${icons[type]} ${message}`);
+  // Validate channel object
+  if (!channel || typeof channel.send !== "function") {
+    console.error(`❌ Invalid channel object passed to logToDiscord`);
+    console.log(`${icons[type]} ${message}`);
+    return Promise.resolve();
+  }
+
+  return channel.send(`${icons[type]} ${message}`).catch((err) => {
+    console.error(`Failed to send Discord message: ${err.message}`);
+  });
 }
 
 // Load environment variables
@@ -133,6 +142,9 @@ client.once("ready", () => {
 async function retryUpload(uploadFunction, account, ...args) {
   let lastError = null;
 
+  // Extract channel from args (should be the last argument)
+  const channel = args[args.length - 1];
+
   for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
     try {
       console.log(
@@ -140,9 +152,9 @@ async function retryUpload(uploadFunction, account, ...args) {
       );
       const result = await uploadFunction(account, ...args);
 
-      if (attempt > 1) {
+      if (attempt > 1 && channel) {
         await logToDiscord(
-          args[args.length - 1],
+          channel,
           `✅ Upload succeeded on attempt ${attempt} for ${account.name}`,
           "success"
         );
@@ -162,13 +174,15 @@ async function retryUpload(uploadFunction, account, ...args) {
           RETRY_CONFIG.maxDelay
         );
 
-        await logToDiscord(
-          args[args.length - 1],
-          `⚠️ Upload attempt ${attempt} failed for ${
-            account.name
-          }. Retrying in ${Math.round(delay / 1000)}s...`,
-          "warning"
-        );
+        if (channel) {
+          await logToDiscord(
+            channel,
+            `⚠️ Upload attempt ${attempt} failed for ${
+              account.name
+            }. Retrying in ${Math.round(delay / 1000)}s...`,
+            "warning"
+          );
+        }
         await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
@@ -223,7 +237,10 @@ client.on("messageCreate", async (message) => {
       const apiResponse = await axios.get(
         `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(
           reelUrl
-        )}`
+        )}`,
+        {
+          timeout: TIMEOUTS.OEMBED_API,
+        }
       );
       if (apiResponse.data && apiResponse.data.author_name) {
         author = apiResponse.data.author_name;
@@ -289,16 +306,26 @@ client.on("messageCreate", async (message) => {
     }
 
     const memUsage = process.memoryUsage();
-    if (memUsage.heapUsed > 500 * 1024 * 1024) {
-      console.log(
-        `High memory usage detected: ${Math.round(
-          memUsage.heapUsed / 1024 / 1024
-        )}MB`
+    const memUsageMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+
+    // Reject session if memory is critically high
+    if (memUsage.heapUsed > 800 * 1024 * 1024) {
+      // 800MB threshold
+      activeSessions.delete(sessionId);
+      await message.reply(
+        `❌ Server memory critically high (${memUsageMB}MB). Please try again in a few minutes.`
       );
+      console.error(
+        `Session ${sessionId} rejected due to high memory: ${memUsageMB}MB`
+      );
+      return;
+    } else if (memUsage.heapUsed > 500 * 1024 * 1024) {
+      console.warn(`⚠️ High memory usage: ${memUsageMB}MB`);
     }
 
-    const stats = fs.statSync(videosDir);
-    console.log(`Session ${sessionId}: System checks passed`);
+    console.log(
+      `Session ${sessionId}: System checks passed (Memory: ${memUsageMB}MB)`
+    );
   } catch (diskError) {
     activeSessions.delete(sessionId);
     await message.reply(
@@ -381,29 +408,47 @@ client.on("messageCreate", async (message) => {
     let finalPath = videoPath;
 
     try {
+      // Step 1: stripAllMetadata does: 1.1x speed + 2% brightness + bg music
       cleanedPath = await stripAllMetadata(videoPath, sessionId);
-      editedPath = await processVideo(cleanedPath, sessionId);
-      finalPath = await addPromoToVideo(editedPath, sessionId, {
-        text: "idolchat.app",
-        subtitle: "Better than c.ai",
-        x: 70,
-        y: 150,
-        appearAt: 0.5,
-        visibleFor: 5.0,
-        fadeInDuration: 0.3,
-        fadeOutDuration: 0.3,
-        fontSize: 64,
-        subtitleSize: 38,
-        barWidth: 8,
-        barColor: "red",
-        textColor: "white",
-      });
+
+      // Step 2: Add text overlay branding (optional, controlled by env var)
+      const ADD_BRANDING = process.env.ADD_VIDEO_BRANDING !== "false"; // Default: true
+      if (ADD_BRANDING) {
+        try {
+          finalPath = await addPromoToVideo(cleanedPath, sessionId, {
+            text: "idolchat.app",
+            subtitle: "Better than c.ai",
+            x: 70,
+            y: 150,
+            appearAt: 0.5,
+            visibleFor: 5.0,
+            fadeInDuration: 0.3,
+            fadeOutDuration: 0.3,
+            fontSize: 64,
+            subtitleSize: 38,
+            barWidth: 8,
+            barColor: "red",
+            textColor: "white",
+            crf: 23,
+            preset: "ultrafast", // Changed from "medium" to "ultrafast" for speed
+          });
+          console.log(`✅ Branding added for session: ${sessionId}`);
+        } catch (brandingError) {
+          console.error(
+            `⚠️ Branding failed for session ${sessionId}: ${brandingError.message}`
+          );
+          finalPath = cleanedPath; // Fallback to cleaned video without branding
+        }
+      } else {
+        console.log(`ℹ️ Branding disabled for session: ${sessionId}`);
+        finalPath = cleanedPath;
+      }
     } catch (processingError) {
       console.error(
         `Processing error for session ${sessionId}:`,
         processingError.message
       );
-      finalPath = videoPath;
+      finalPath = videoPath; // Fallback to original video
     }
 
     await updateStatus("🎬 Reel Processing Status", "Uploading to Discord...", [
@@ -509,7 +554,8 @@ client.on("messageCreate", async (message) => {
     let completedUploads = 0;
     const totalUploads = ACCOUNTS.length;
 
-    for (let account of ACCOUNTS) {
+    for (let i = 0; i < ACCOUNTS.length; i++) {
+      const account = ACCOUNTS[i];
       try {
         await updateStatus(
           "📤 Upload Progress",
@@ -537,6 +583,7 @@ client.on("messageCreate", async (message) => {
           message.channel,
           originalCaption,
           isRepost,
+          3, // maxRetries
           aiGeneratedCaption // Pass the pre-generated caption
         );
         completedUploads++;
@@ -552,7 +599,10 @@ client.on("messageCreate", async (message) => {
           "info"
         );
       }
-      await delay(DELAYS.BETWEEN_ACCOUNTS);
+      // Only delay if not the last account
+      if (i < ACCOUNTS.length - 1) {
+        await delay(DELAYS.BETWEEN_ACCOUNTS);
+      }
     }
 
     // Upload to YouTube accounts
@@ -574,7 +624,8 @@ client.on("messageCreate", async (message) => {
 
     const ytTags = ["kpop", "kdrama", "idolchat", "viral", "trending", author];
 
-    for (let ytAccount of YOUTUBE_ACCOUNTS) {
+    for (let j = 0; j < YOUTUBE_ACCOUNTS.length; j++) {
+      const ytAccount = YOUTUBE_ACCOUNTS[j];
       try {
         await updateStatus(
           "📤 YouTube Upload Progress",
@@ -613,7 +664,10 @@ client.on("messageCreate", async (message) => {
           "info"
         );
       }
-      await delay(DELAYS.BETWEEN_YOUTUBE); // Delay between YouTube uploads
+      // Only delay if not the last account
+      if (j < YOUTUBE_ACCOUNTS.length - 1) {
+        await delay(DELAYS.BETWEEN_YOUTUBE);
+      }
     }
 
     try {
@@ -624,15 +678,29 @@ client.on("messageCreate", async (message) => {
         path.join(__dirname, "videos", `final_reel_${sessionId}.mp4`),
       ];
 
-      // Also clean up any retry attempt files
+      // Also clean up any retry attempt files for THIS session only
       try {
         const videosDir = path.join(__dirname, "videos");
         if (fs.existsSync(videosDir)) {
           const allFiles = fs.readdirSync(videosDir);
+          const now = Date.now();
           const retryFiles = allFiles
-            .filter(
-              (f) => f.includes(sessionId) || f.startsWith("instagram_upload_")
-            )
+            .filter((f) => {
+              // Clean session-specific files
+              if (f.includes(sessionId)) return true;
+              // Clean orphaned instagram_upload files older than 10 minutes
+              if (f.startsWith("instagram_upload_")) {
+                try {
+                  const filePath = path.join(videosDir, f);
+                  const stats = fs.statSync(filePath);
+                  const ageMs = now - stats.mtimeMs;
+                  return ageMs > 600000; // 10 minutes
+                } catch (e) {
+                  return false;
+                }
+              }
+              return false;
+            })
             .map((f) => path.join(videosDir, f));
           filesToClean.push(...retryFiles);
         }
@@ -731,9 +799,11 @@ client.on("messageCreate", async (message) => {
           { name: "Author", value: author, inline: true },
           {
             name: "Time Taken",
-            value: `${Math.round(
-              (Date.now() - statusMsg.createdTimestamp) / 1000
-            )}s`,
+            value: statusMsg
+              ? `${Math.round(
+                  (Date.now() - statusMsg.createdTimestamp) / 1000
+                )}s`
+              : "N/A",
             inline: true,
           },
         ],
@@ -757,9 +827,11 @@ client.on("messageCreate", async (message) => {
           { name: "Author", value: author, inline: true },
           {
             name: "Time Taken",
-            value: `${Math.round(
-              (Date.now() - statusMsg.createdTimestamp) / 1000
-            )}s`,
+            value: statusMsg
+              ? `${Math.round(
+                  (Date.now() - statusMsg.createdTimestamp) / 1000
+                )}s`
+              : "N/A",
             inline: true,
           },
         ],
@@ -773,6 +845,68 @@ client.on("messageCreate", async (message) => {
       "error"
     );
     console.error(`Process failed for session ${sessionId}:`, error);
+
+    // Clean up files on error
+    try {
+      const filesToClean = [
+        path.join(__dirname, "videos", `reel_${sessionId}.mp4`),
+        path.join(__dirname, "videos", `cleaned_${sessionId}.mp4`),
+        path.join(__dirname, "videos", `edited_reel_${sessionId}.mp4`),
+        path.join(__dirname, "videos", `final_reel_${sessionId}.mp4`),
+      ];
+
+      // Also clean up any retry attempt files for THIS session only
+      try {
+        const videosDir = path.join(__dirname, "videos");
+        if (fs.existsSync(videosDir)) {
+          const allFiles = fs.readdirSync(videosDir);
+          const now = Date.now();
+          const retryFiles = allFiles
+            .filter((f) => {
+              // Clean session-specific files
+              if (f.includes(sessionId)) return true;
+              // Clean orphaned instagram_upload files older than 10 minutes
+              if (f.startsWith("instagram_upload_")) {
+                try {
+                  const filePath = path.join(videosDir, f);
+                  const stats = fs.statSync(filePath);
+                  const ageMs = now - stats.mtimeMs;
+                  return ageMs > 600000; // 10 minutes
+                } catch (e) {
+                  return false;
+                }
+              }
+              return false;
+            })
+            .map((f) => path.join(videosDir, f));
+          filesToClean.push(...retryFiles);
+        }
+      } catch (dirError) {
+        console.error(`Error reading videos directory:`, dirError.message);
+      }
+
+      const uniqueFiles = [...new Set(filesToClean)];
+      for (const file of uniqueFiles) {
+        try {
+          if (fs.existsSync(file)) {
+            fs.unlinkSync(file);
+            console.log(`🧹 Cleaned up (error): ${path.basename(file)}`);
+          }
+        } catch (cleanupErr) {
+          if (cleanupErr.code !== "ENOENT") {
+            console.error(
+              `Failed to delete ${path.basename(file)}:`,
+              cleanupErr.message
+            );
+          }
+        }
+      }
+    } catch (cleanupError) {
+      console.error(
+        `Cleanup error for session ${sessionId}:`,
+        cleanupError.message
+      );
+    }
   } finally {
     // Ensure session is always cleaned up on error
     if (activeSessions.has(sessionId)) {
@@ -825,14 +959,22 @@ async function downloadReel(
       console.log(`� Extracting original caption for session: ${sessionId}`);
 
       const captionPromise = extractInstagramCaption(instagramUrl, sessionId);
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(
+      let captionTimeout;
+      const timeoutPromise = new Promise((_, reject) => {
+        captionTimeout = setTimeout(
           () => reject(new Error("Caption extraction timeout")),
           TIMEOUTS.CAPTION_EXTRACTION
-        )
-      );
+        );
+      });
 
-      const captionData = await Promise.race([captionPromise, timeoutPromise]);
+      let captionData;
+      try {
+        captionData = await Promise.race([captionPromise, timeoutPromise]);
+        clearTimeout(captionTimeout);
+      } catch (error) {
+        clearTimeout(captionTimeout);
+        throw error;
+      }
 
       if (captionData?.caption && typeof captionData.caption === "string") {
         originalCaption = captionData.caption
@@ -873,102 +1015,150 @@ async function downloadReel(
     }
 
     const videoPath = path.join(__dirname, "videos", `reel_${sessionId}.mp4`);
-    const writer = fs.createWriteStream(videoPath);
-    const videoResponse = await axios.get(videoUrl, {
-      responseType: "stream",
-      timeout: TIMEOUTS.AXIOS_DOWNLOAD,
-      maxContentLength: 100 * 1024 * 1024, // 100MB max
-      validateStatus: (status) => status === 200, // Only accept 200 status
-    });
+    let writer = null;
+    let videoResponse = null;
+    let downloadTimeout = null;
+    let probeTimeout = null;
+    let promiseResolved = false;
 
-    if (!videoResponse.headers["content-type"]?.includes("video/")) {
-      throw new Error("Invalid content type received for video");
-    }
+    const cleanup = () => {
+      if (downloadTimeout) clearTimeout(downloadTimeout);
+      if (probeTimeout) clearTimeout(probeTimeout);
+      try {
+        if (writer && !writer.destroyed) writer.destroy();
+      } catch (e) {}
+      try {
+        if (videoResponse?.data && !videoResponse.data.destroyed)
+          videoResponse.data.destroy();
+      } catch (e) {}
+    };
 
-    videoResponse.data.pipe(writer);
-
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        try {
-          writer.destroy();
-        } catch (e) {}
-        try {
-          videoResponse.data.destroy(); // Also destroy response stream
-        } catch (e) {}
-        fs.unlink(videoPath, () => {}); // Clean up partial file
-        reject(new Error(`Download timeout for session ${sessionId}`));
-      }, TIMEOUTS.DOWNLOAD_TOTAL);
-
-      writer.on("error", (err) => {
-        clearTimeout(timeout);
-        try {
-          writer.destroy(); // Properly close the stream
-        } catch (e) {}
-        try {
-          videoResponse.data.destroy(); // Close the response stream
-        } catch (e) {}
-        fs.unlink(videoPath, () => {});
-        reject(new Error(`Video write error: ${err.message}`));
+    try {
+      writer = fs.createWriteStream(videoPath);
+      videoResponse = await axios.get(videoUrl, {
+        responseType: "stream",
+        timeout: TIMEOUTS.AXIOS_DOWNLOAD,
+        maxContentLength: 100 * 1024 * 1024, // 100MB max
+        validateStatus: (status) => status === 200, // Only accept 200 status
       });
 
-      writer.on("finish", () => {
-        clearTimeout(timeout);
+      if (!videoResponse.headers["content-type"]?.includes("video/")) {
+        cleanup();
+        throw new Error("Invalid content type received for video");
+      }
 
-        // Verify file size
-        const stats = fs.statSync(videoPath);
-        if (stats.size < FILE_LIMITS.MIN_VIDEO_SIZE) {
-          // Less than 1KB is definitely invalid
+      videoResponse.data.pipe(writer);
+
+      return new Promise((resolve, reject) => {
+        downloadTimeout = setTimeout(() => {
+          if (!promiseResolved) {
+            promiseResolved = true;
+            cleanup();
+            fs.unlink(videoPath, () => {});
+            reject(new Error(`Download timeout for session ${sessionId}`));
+          }
+        }, TIMEOUTS.DOWNLOAD_TOTAL);
+
+        writer.on("error", (err) => {
+          if (!promiseResolved) {
+            promiseResolved = true;
+            cleanup();
+            fs.unlink(videoPath, () => {});
+            reject(new Error(`Video write error: ${err.message}`));
+          }
+        });
+
+        writer.on("finish", () => {
+          if (promiseResolved) return;
+          clearTimeout(downloadTimeout);
+
+          // Verify file size
+          let stats;
           try {
-            writer.destroy();
-          } catch (e) {}
-          fs.unlink(videoPath, () => {});
-          reject(new Error("Downloaded file is too small to be a valid video"));
-          return;
-        }
+            stats = fs.statSync(videoPath);
+          } catch (err) {
+            promiseResolved = true;
+            cleanup();
+            reject(new Error(`Failed to stat file: ${err.message}`));
+            return;
+          }
 
-        // Validate video file with ffprobe
-        ffmpeg.ffprobe(videoPath, (err, metadata) => {
-          if (
-            err ||
-            !metadata ||
-            !metadata.streams ||
-            metadata.streams.length === 0
-          ) {
-            console.error(
-              `Invalid video file for session ${sessionId}:`,
-              err?.message || "No streams found"
+          if (stats.size < FILE_LIMITS.MIN_VIDEO_SIZE) {
+            promiseResolved = true;
+            cleanup();
+            fs.unlink(videoPath, () => {});
+            reject(
+              new Error("Downloaded file is too small to be a valid video")
             );
-            try {
-              writer.destroy();
-            } catch (e) {}
-            fs.unlink(videoPath, () => {});
-            reject(new Error("Downloaded file is not a valid video"));
             return;
           }
 
-          const hasVideo = metadata.streams.some(
-            (s) => s.codec_type === "video"
-          );
-          if (!hasVideo) {
-            console.error(`No video stream found for session ${sessionId}`);
-            try {
-              writer.destroy();
-            } catch (e) {}
-            fs.unlink(videoPath, () => {});
-            reject(new Error("Downloaded file has no video stream"));
-            return;
-          }
+          // Validate video file with ffprobe (with timeout)
+          let probeCompleted = false;
+          probeTimeout = setTimeout(() => {
+            if (!probeCompleted && !promiseResolved) {
+              promiseResolved = true;
+              console.error(`FFprobe timeout for session ${sessionId}`);
+              cleanup();
+              fs.unlink(videoPath, () => {});
+              reject(new Error("Video validation timeout"));
+            }
+          }, 30000); // 30 second timeout
 
-          console.log(`Downloaded reel for session: ${sessionId}`);
-          resolve({
-            videoPath,
-            originalCaption,
-            originalHashtags,
-            isRepost,
+          ffmpeg.ffprobe(videoPath, (err, metadata) => {
+            probeCompleted = true;
+            clearTimeout(probeTimeout);
+
+            if (promiseResolved) return;
+
+            if (
+              err ||
+              !metadata ||
+              !metadata.streams ||
+              metadata.streams.length === 0
+            ) {
+              promiseResolved = true;
+              console.error(
+                `Invalid video file for session ${sessionId}:`,
+                err?.message || "No streams found"
+              );
+              cleanup();
+              fs.unlink(videoPath, () => {});
+              reject(new Error("Downloaded file is not a valid video"));
+              return;
+            }
+
+            const hasVideo = metadata.streams.some(
+              (s) => s.codec_type === "video"
+            );
+            if (!hasVideo) {
+              promiseResolved = true;
+              console.error(`No video stream found for session ${sessionId}`);
+              cleanup();
+              fs.unlink(videoPath, () => {});
+              reject(new Error("Downloaded file has no video stream"));
+              return;
+            }
+
+            promiseResolved = true;
+            cleanup();
+            console.log(`Downloaded reel for session: ${sessionId}`);
+            resolve({
+              videoPath,
+              originalCaption,
+              originalHashtags,
+              isRepost,
+            });
           });
         });
       });
-    });
+    } catch (error) {
+      cleanup();
+      if (fs.existsSync(videoPath)) {
+        fs.unlink(videoPath, () => {});
+      }
+      throw error;
+    }
   } catch (error) {
     console.log(`Download error for session ${sessionId}:`, error);
     throw new Error(`Failed to download reel: ${error.message}`);
@@ -987,20 +1177,23 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       instagramUrl
     )}`;
 
+    let oembedTimeout;
     const oembedResponse = await Promise.race([
-      axios.get(oembedUrl, {
-        timeout: TIMEOUTS.OEMBED_API,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-      }),
-      new Promise((_, reject) =>
-        setTimeout(
+      axios
+        .get(oembedUrl, {
+          timeout: TIMEOUTS.OEMBED_API,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+          },
+        })
+        .finally(() => clearTimeout(oembedTimeout)),
+      new Promise((_, reject) => {
+        oembedTimeout = setTimeout(
           () => reject(new Error("oEmbed timeout")),
           TIMEOUTS.OEMBED_API
-        )
-      ),
+        );
+      }),
     ]);
 
     if (oembedResponse?.data?.title) {
@@ -1031,19 +1224,25 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
 
     const altApiUrl = `https://www.instagram.com/api/v1/media/info/?shortcode=${shortcode}`;
 
+    let altTimeout;
     const altResponse = await Promise.race([
-      axios.get(altApiUrl, {
-        timeout: TIMEOUTS.ALT_API,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
+      axios
+        .get(altApiUrl, {
+          timeout: TIMEOUTS.ALT_API,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15",
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          },
+        })
+        .finally(() => clearTimeout(altTimeout)),
+      new Promise((_, reject) => {
+        altTimeout = setTimeout(
+          () => reject(new Error("Alt API timeout")),
+          TIMEOUTS.ALT_API
+        );
       }),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Alt API timeout")), TIMEOUTS.ALT_API)
-      ),
     ]);
 
     if (altResponse?.data?.caption) {
@@ -1068,25 +1267,28 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
   try {
     console.log(`Trying basic scraping for session: ${sessionId}`);
 
+    let scrapingTimeout;
     const response = await Promise.race([
-      axios.get(instagramUrl, {
-        timeout: TIMEOUTS.SCRAPING,
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-          Accept:
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-          "Accept-Language": "en-US,en;q=0.5",
-          "Accept-Encoding": "gzip, deflate",
-          Connection: "keep-alive",
-        },
-      }),
-      new Promise((_, reject) =>
-        setTimeout(
+      axios
+        .get(instagramUrl, {
+          timeout: TIMEOUTS.SCRAPING,
+          headers: {
+            "User-Agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            Accept:
+              "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate",
+            Connection: "keep-alive",
+          },
+        })
+        .finally(() => clearTimeout(scrapingTimeout)),
+      new Promise((_, reject) => {
+        scrapingTimeout = setTimeout(
           () => reject(new Error("Scraping timeout")),
           TIMEOUTS.SCRAPING
-        )
-      ),
+        );
+      }),
     ]);
 
     // Safely handle HTML content
@@ -1219,6 +1421,11 @@ function generateHashtags() {
 
 async function addPromoToVideo(videoPath, sessionId, opts = {}) {
   return new Promise((resolve) => {
+    let promiseResolved = false;
+    let probeTimeout = null;
+    let processingTimeout = null;
+    let cmd = null;
+
     try {
       const outDir = path.join(__dirname, "videos");
       if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
@@ -1245,14 +1452,33 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
         preset = "medium",
       } = opts;
 
+      // Timeout for ffprobe
+      let probeCompleted = false;
+      probeTimeout = setTimeout(() => {
+        if (!probeCompleted && !promiseResolved) {
+          promiseResolved = true;
+          console.error(
+            `❌ FFprobe timeout in addPromoToVideo for session ${sessionId}`
+          );
+          resolve(videoPath);
+        }
+      }, 30000); // 30 second timeout
+
       ffmpeg.ffprobe(videoPath, (err, metadata) => {
+        probeCompleted = true;
+        clearTimeout(probeTimeout);
+
+        if (promiseResolved) return;
+
         if (err) {
+          promiseResolved = true;
           console.error("ffprobe error:", err.message);
           return resolve(videoPath);
         }
 
         const vs = metadata.streams.find((s) => s.codec_type === "video");
         if (!vs) {
+          promiseResolved = true;
           console.error("No video stream found.");
           return resolve(videoPath);
         }
@@ -1313,7 +1539,29 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
           .replace(/:/g, "\\:")
           .replace(/'/g, "\\'");
 
-        const cmd = ffmpeg(videoPath)
+        // Timeout for FFmpeg processing (3 minutes)
+        processingTimeout = setTimeout(() => {
+          if (!promiseResolved) {
+            promiseResolved = true;
+            console.error(
+              `❌ FFmpeg timeout in addPromoToVideo for session ${sessionId}`
+            );
+            try {
+              if (cmd) cmd.kill("SIGKILL");
+            } catch (e) {
+              console.error(`Failed to kill FFmpeg: ${e.message}`);
+            }
+            // Clean up partial file
+            if (fs.existsSync(finalPath)) {
+              try {
+                fs.unlinkSync(finalPath);
+              } catch (e) {}
+            }
+            resolve(videoPath);
+          }
+        }, 180000); // 3 minute timeout
+
+        cmd = ffmpeg(videoPath)
           .complexFilter([
             // Scale and pad video
             `[0:v]${scaleFilter}[scaled]`,
@@ -1363,31 +1611,50 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
             if (line) console.log("[ffmpeg]", line);
           })
           .on("end", () => {
-            console.log(
-              `✅ Netflix-style text overlay added ${showStart}s→${showEnd}s: ${finalPath}`
-            );
-            resolve(finalPath);
+            clearTimeout(processingTimeout);
+            if (!promiseResolved) {
+              promiseResolved = true;
+              console.log(
+                `✅ Netflix-style text overlay added ${showStart}s→${showEnd}s: ${finalPath}`
+              );
+              resolve(finalPath);
+            }
           })
           .on("error", (e) => {
-            try {
-              cmd.kill("SIGKILL"); // Kill FFmpeg process to prevent leak
-            } catch (killError) {
-              console.error(
-                "Failed to kill FFmpeg process:",
-                killError.message
+            clearTimeout(processingTimeout);
+            if (!promiseResolved) {
+              promiseResolved = true;
+              try {
+                cmd.kill("SIGKILL"); // Kill FFmpeg process to prevent leak
+              } catch (killError) {
+                console.error(
+                  "Failed to kill FFmpeg process:",
+                  killError.message
+                );
+              }
+              // Clean up partial file
+              if (fs.existsSync(finalPath)) {
+                try {
+                  fs.unlinkSync(finalPath);
+                } catch (e) {}
+              }
+              console.log(
+                `⚠️ Text overlay failed (${e.message}). Returning original.`
               );
+              resolve(videoPath);
             }
-            console.log(
-              `⚠️ Text overlay failed (${e.message}). Returning original.`
-            );
-            resolve(videoPath);
           });
 
         cmd.output(finalPath).run();
       });
     } catch (e) {
-      console.log("⚠️ addPromoToVideo unexpected error:", e.message);
-      return resolve(videoPath);
+      if (probeTimeout) clearTimeout(probeTimeout);
+      if (processingTimeout) clearTimeout(processingTimeout);
+      if (!promiseResolved) {
+        promiseResolved = true;
+        console.log("⚠️ addPromoToVideo unexpected error:", e.message);
+        resolve(videoPath);
+      }
     }
   });
 }
@@ -1400,11 +1667,313 @@ async function stripAllMetadata(videoPath, sessionId) {
       `cleaned_${sessionId}.mp4`
     );
 
-    console.log(`🧹 Stripping ALL metadata for session: ${sessionId}`);
+    console.log(
+      `🧹 Processing video (1.1x + 2% brightness + bgmusic) for session: ${sessionId}`
+    );
 
-    // Simple metadata stripping - no complex fake data to avoid FFmpeg errors
-    ffmpeg(videoPath)
-      .outputOptions([
+    // Check for background music
+    const bgMusicPath = path.join(__dirname, "bg-music.mp3");
+    const hasBgMusic = fs.existsSync(bgMusicPath);
+
+    let probeCompleted = false;
+    let promiseResolved = false;
+
+    // Timeout for ffprobe
+    const probeTimeout = setTimeout(() => {
+      if (!probeCompleted && !promiseResolved) {
+        promiseResolved = true;
+        console.error(`❌ FFprobe timeout for session ${sessionId}`);
+        resolve(videoPath);
+      }
+    }, 30000);
+
+    // Probe video first
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      probeCompleted = true;
+      clearTimeout(probeTimeout);
+
+      if (promiseResolved) return; // Already timed out
+
+      if (err) {
+        promiseResolved = true;
+        console.error(`❌ Probe failed: ${err.message}`);
+        resolve(videoPath);
+        return;
+      }
+
+      const videoStream = metadata.streams.find(
+        (s) => s.codec_type === "video"
+      );
+      const hasAudio = metadata.streams.some((s) => s.codec_type === "audio");
+      const videoWidth = videoStream?.width || 1920;
+      const videoHeight = videoStream?.height || 1080;
+
+      // Calculate video duration after 1.1x speedup
+      const originalDuration = parseFloat(metadata.format.duration);
+      const speedupDuration = originalDuration / 1.1; // Video will be shorter after speedup
+
+      let filterComplex = [];
+
+      // 1. Speed up video + add 2% brightness (simpler than overlay)
+      filterComplex.push("[0:v]setpts=PTS/1.1,eq=brightness=0.02[vout]");
+
+      // 2. Audio processing
+      if (hasAudio) {
+        filterComplex.push("[0:a]atempo=1.1[a1]");
+        if (hasBgMusic) {
+          // Trim background music to match sped-up video duration, then mix
+          filterComplex.push(
+            `[1:a]atrim=0:${speedupDuration},volume=0.05[bgm]`
+          );
+          filterComplex.push("[a1][bgm]amix=inputs=2:duration=first[aout]");
+        } else {
+          filterComplex.push("[a1]acopy[aout]");
+        }
+      } else if (hasBgMusic) {
+        // Trim background music to match sped-up video duration
+        filterComplex.push(`[1:a]atrim=0:${speedupDuration},volume=0.05[aout]`);
+      }
+
+      const command = ffmpeg(videoPath);
+      if (hasBgMusic) command.input(bgMusicPath);
+
+      // Timeout for FFmpeg processing (3 minutes for safety)
+      const processingTimeout = setTimeout(() => {
+        if (!promiseResolved) {
+          promiseResolved = true;
+          console.error(`❌ FFmpeg timeout for session ${sessionId}`);
+          try {
+            command.kill("SIGKILL");
+          } catch (e) {
+            console.error(`Failed to kill FFmpeg process: ${e.message}`);
+          }
+          // Clean up partial file
+          if (fs.existsSync(cleanedPath)) {
+            try {
+              fs.unlinkSync(cleanedPath);
+            } catch (e) {}
+          }
+          resolve(videoPath);
+        }
+      }, 180000); // 3 minute timeout (increased from 2 for complex videos)
+
+      command.complexFilter(filterComplex.join(";")).outputOptions([
+        "-map",
+        "[vout]",
+        "-map_metadata",
+        "-1",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart", // Enable fast start for better streaming
+      ]);
+
+      if (hasAudio || hasBgMusic) {
+        command.outputOptions([
+          "-map",
+          "[aout]",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+        ]);
+
+        // If only bgMusic, ensure it stops at video end
+        if (!hasAudio && hasBgMusic) {
+          command.outputOptions(["-shortest"]);
+        }
+      }
+
+      command
+        .output(cleanedPath)
+        .on("start", (cmdLine) => {
+          console.log(`🎬 FFmpeg started for session: ${sessionId}`);
+        })
+        .on("end", () => {
+          clearTimeout(processingTimeout);
+          if (!promiseResolved) {
+            promiseResolved = true;
+            console.log(
+              `✅ Processed (1.1x + 2% + bgmusic) for session: ${sessionId}`
+            );
+            resolve(cleanedPath);
+          }
+        })
+        .on("error", (err) => {
+          clearTimeout(processingTimeout);
+          if (!promiseResolved) {
+            promiseResolved = true;
+            console.error(`❌ Processing failed: ${err.message}`);
+            // Clean up partial file
+            if (fs.existsSync(cleanedPath)) {
+              try {
+                fs.unlinkSync(cleanedPath);
+              } catch (e) {}
+            }
+            resolve(videoPath);
+          }
+        })
+        .run();
+    });
+  });
+}
+
+// OLD COMPLEX VERSION - DISABLED
+async function stripAllMetadata_OLD(videoPath, sessionId) {
+  return new Promise((resolve, reject) => {
+    const cleanedPath = path.join(
+      __dirname,
+      "videos",
+      `cleaned_${sessionId}.mp4`
+    );
+
+    console.log(
+      `🧹 Processing video with modifications for session: ${sessionId}`
+    );
+
+    // Check if background music exists
+    const bgMusicPath = path.join(__dirname, "bg-music.mp3");
+    // TEMPORARILY DISABLED: Background music causing timeout issues
+    const hasBgMusic = false; // fs.existsSync(bgMusicPath);
+
+    if (!hasBgMusic) {
+      console.log(`⚠️ Background music disabled (testing)`);
+    }
+
+    let command = null; // Declare command variable in outer scope
+    let processingTimeout = null;
+    let probeCompleted = false;
+    let promiseResolved = false; // Track if promise already resolved
+
+    // Timeout for ffprobe itself
+    const probeTimeout = setTimeout(() => {
+      if (!probeCompleted && !promiseResolved) {
+        promiseResolved = true;
+        console.error(`❌ FFprobe timeout for session ${sessionId}`);
+        resolve(videoPath); // Fallback to original
+      }
+    }, 30000); // 30 second timeout for probe
+
+    // First probe the video to get dimensions and check for audio
+    ffmpeg.ffprobe(videoPath, (err, metadata) => {
+      probeCompleted = true;
+      clearTimeout(probeTimeout);
+
+      // Don't proceed if promise already resolved by timeout
+      if (promiseResolved) {
+        console.warn(
+          `FFprobe completed after timeout for session ${sessionId}`
+        );
+        return;
+      }
+
+      if (err) {
+        promiseResolved = true;
+        console.error(
+          `❌ Failed to probe video for session ${sessionId}:`,
+          err.message
+        );
+        resolve(videoPath); // Fallback to original
+        return;
+      }
+
+      const videoStream = metadata.streams.find(
+        (s) => s.codec_type === "video"
+      );
+      const audioStream = metadata.streams.find(
+        (s) => s.codec_type === "audio"
+      );
+
+      if (!videoStream) {
+        promiseResolved = true;
+        console.error(`❌ No video stream found for session ${sessionId}`);
+        resolve(videoPath);
+        return;
+      }
+
+      const hasAudio = !!audioStream;
+      const videoWidth = videoStream.width || 1920;
+      const videoHeight = videoStream.height || 1080;
+
+      console.log(
+        `📹 Video info: ${videoWidth}x${videoHeight}, Audio: ${
+          hasAudio ? "Yes" : "No"
+        }`
+      );
+
+      // Build complex filter for video modifications
+      let filterComplex = [];
+
+      // 1. Speed up video to 1.1x
+      filterComplex.push("[0:v]setpts=PTS/1.1[v1]");
+
+      // 2. Add white overlay at 2% opacity (use actual video dimensions)
+      // Use blend filter instead of RGBA conversion - MUCH faster
+      filterComplex.push(
+        `color=white:s=${videoWidth}x${videoHeight}:d=9999[white]`
+      );
+      filterComplex.push(
+        "[v1][white]blend=all_mode=overlay:all_opacity=0.02[vout]"
+      );
+
+      // 3. Handle audio processing
+      if (hasAudio) {
+        // Speed up original audio to 1.1x
+        filterComplex.push("[0:a]atempo=1.1[a1]");
+
+        // 4. Mix with background music at 5% volume if available
+        if (hasBgMusic) {
+          // Background music is already looped via -stream_loop input option
+          // Just adjust volume and mix with shortest duration
+          filterComplex.push("[1:a]volume=0.05[bgm]");
+          filterComplex.push("[a1][bgm]amix=inputs=2:duration=shortest[aout]");
+        } else {
+          // Just use the sped-up audio
+          filterComplex.push("[a1]anull[aout]");
+        }
+      } else {
+        // No audio in original video
+        if (hasBgMusic) {
+          // Use only background music
+          // The -shortest output option will ensure audio matches video length
+          filterComplex.push("[1:a]volume=0.05[aout]");
+        }
+        // If no audio and no bg music, video will have no audio track
+      }
+
+      command = ffmpeg(videoPath);
+
+      // Now that command is created, set up the timeout
+      processingTimeout = setTimeout(() => {
+        console.error(`❌ Video processing timeout for session ${sessionId}`);
+        try {
+          if (command) command.kill("SIGKILL");
+        } catch (e) {
+          console.error(`Failed to kill FFmpeg process: ${e.message}`);
+        }
+        // Clean up partial output file
+        if (fs.existsSync(cleanedPath)) {
+          try {
+            fs.unlinkSync(cleanedPath);
+          } catch (e) {}
+        }
+        resolve(videoPath); // Fallback to original
+      }, 300000); // 5 minute timeout
+
+      // Add background music as input if available
+      if (hasBgMusic) {
+        command.input(bgMusicPath); // Don't loop - will be handled by amix duration
+      }
+
+      const outputOptions = [
+        // Map the processed video
+        "-map",
+        "[vout]",
+
         // Strip ALL existing metadata completely
         "-map_metadata",
         "-1",
@@ -1413,37 +1982,105 @@ async function stripAllMetadata(videoPath, sessionId) {
         "-map_metadata:s:a",
         "-1",
 
-        // Copy codecs without re-encoding for speed
+        // Video encoding settings (optimized for speed)
         "-c:v",
-        "copy",
-        "-c:a",
-        "copy",
+        "libx264",
+        "-preset",
+        "ultrafast", // Changed to ultrafast for maximum speed
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p", // Ensure compatibility
+        "-tune",
+        "fastdecode", // Optimize for fast decoding
 
         // Remove all flags and timestamps
         "-fflags",
         "+bitexact",
         "-avoid_negative_ts",
         "make_zero",
-      ])
-      .output(cleanedPath)
-      .on("end", () => {
-        console.log(
-          `✅ All metadata stripped successfully for session: ${sessionId}`
-        );
-        resolve(cleanedPath);
-      })
-      .on("error", (err) => {
-        console.error(
-          `❌ Metadata stripping failed for session ${sessionId}:`,
-          err.message
-        );
-        console.log(
-          `⚠️ Using original video (metadata not stripped) for session: ${sessionId}`
-        );
-        // Fallback to original if metadata stripping fails
-        resolve(videoPath);
-      })
-      .run();
+      ];
+
+      // Only map audio if we have an audio output
+      if (hasAudio || hasBgMusic) {
+        outputOptions.unshift("-map", "[aout]");
+        outputOptions.push("-c:a", "aac", "-b:a", "192k");
+
+        // If using background music without original audio, ensure it stops at video end
+        if (!hasAudio && hasBgMusic) {
+          outputOptions.push("-shortest");
+        }
+      }
+
+      let logged100 = false; // Track if we've logged 100% already
+
+      command
+        .complexFilter(filterComplex.join(";"))
+        .outputOptions(outputOptions)
+        .output(cleanedPath)
+        .on("start", (cmd) => {
+          console.log(`🎬 FFmpeg started for session: ${sessionId}`);
+        })
+        .on("stderr", (stderrLine) => {
+          // Log important FFmpeg messages
+          if (stderrLine.includes("error") || stderrLine.includes("Error")) {
+            console.error(`FFmpeg: ${stderrLine}`);
+          }
+        })
+        .on("progress", (progress) => {
+          // Cap progress at 100% and only show every 10%
+          if (progress.percent) {
+            const cappedPercent = Math.min(Math.round(progress.percent), 100);
+            // Only log at 10% intervals to reduce spam, and only log 100% once
+            if (cappedPercent % 10 === 0 && cappedPercent < 100) {
+              console.log(`⏳ Processing: ${cappedPercent}%`);
+            } else if (cappedPercent === 100 && !logged100) {
+              logged100 = true;
+              console.log(`⏳ Processing: 100% - Finalizing output file...`);
+            }
+          } else if (progress.timemark) {
+            // Show timemark if percent not available
+            console.log(`⏳ Processing: ${progress.timemark}`);
+          }
+        })
+        .on("end", () => {
+          clearTimeout(processingTimeout);
+          console.log(
+            `✅ Video processed successfully for session: ${sessionId}`
+          );
+          console.log(`   - Sped up to 1.1x ✓`);
+          console.log(`   - White overlay 2% opacity ✓`);
+          console.log(
+            `   - Background music ${
+              hasBgMusic ? "5% volume ✓" : "skipped (no file)"
+            }`
+          );
+          console.log(`   - Metadata stripped ✓`);
+          resolve(cleanedPath);
+        })
+        .on("error", (err) => {
+          clearTimeout(processingTimeout);
+          console.error(
+            `❌ Video processing failed for session ${sessionId}:`,
+            err.message
+          );
+          console.log(`⚠️ Using original video for session: ${sessionId}`);
+
+          // Clean up partial output file on error
+          if (fs.existsSync(cleanedPath)) {
+            try {
+              fs.unlinkSync(cleanedPath);
+              console.log(`🧹 Cleaned up partial file: ${cleanedPath}`);
+            } catch (e) {
+              console.error(`Failed to clean up partial file: ${e.message}`);
+            }
+          }
+
+          // Fallback to original if processing fails
+          resolve(videoPath);
+        })
+        .run();
+    });
   });
 }
 
@@ -1718,14 +2355,21 @@ async function uploadToGitHub(channel, filePath) {
     });
 
     // Add a reasonable timeout for large files
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(
+    let uploadTimeout;
+    const timeoutPromise = new Promise((_, reject) => {
+      uploadTimeout = setTimeout(
         () => reject(new Error("Upload timeout after 2 minutes")),
         TIMEOUTS.GITHUB_UPLOAD
-      )
-    );
+      );
+    });
 
-    await Promise.race([uploadPromise, timeoutPromise]);
+    try {
+      await Promise.race([uploadPromise, timeoutPromise]);
+      clearTimeout(uploadTimeout);
+    } catch (error) {
+      clearTimeout(uploadTimeout);
+      throw error;
+    }
 
     // Generate raw GitHub URL
     const rawUrl = `https://raw.githubusercontent.com/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/main/${githubPath}`;
@@ -1799,6 +2443,7 @@ async function postFirstComment(account, mediaId, channel) {
         headers: {
           "User-Agent": userAgent,
         },
+        timeout: 30000, // 30 second timeout
       }
     );
 
@@ -1870,10 +2515,21 @@ async function uploadToYouTube(
 
     const { google } = await import("googleapis");
 
+    // Validate YouTube credentials
+    if (!process.env.YOUTUBE_CLIENT_ID || !process.env.YOUTUBE_CLIENT_SECRET) {
+      throw new Error("YouTube OAuth credentials not configured in .env file");
+    }
+
+    if (!account.accessToken || !account.refreshToken) {
+      throw new Error(
+        `YouTube account ${account.name} missing access or refresh token`
+      );
+    }
+
     const oauth2Client = new google.auth.OAuth2(
-      process.env.YOUTUBE_CLIENT_ID || "YOUR_CLIENT_ID",
-      process.env.YOUTUBE_CLIENT_SECRET || "YOUR_CLIENT_SECRET",
-      process.env.YOUTUBE_REDIRECT_URI || "YOUR_REDIRECT_URI"
+      process.env.YOUTUBE_CLIENT_ID,
+      process.env.YOUTUBE_CLIENT_SECRET,
+      process.env.YOUTUBE_REDIRECT_URI || "http://localhost:3000/oauth2callback"
     );
 
     oauth2Client.setCredentials({
@@ -1884,13 +2540,28 @@ async function uploadToYouTube(
     // Auto-refresh access token when it expires
     oauth2Client.on("tokens", (tokens) => {
       if (tokens.refresh_token) {
-        console.log(`New refresh token for ${account.name}`);
+        account.refreshToken = tokens.refresh_token;
+        console.log(`🔄 New refresh token for ${account.name}`);
       }
       if (tokens.access_token) {
         account.accessToken = tokens.access_token;
-        console.log(`Access token refreshed for ${account.name}`);
+        console.log(`🔄 Access token refreshed for ${account.name}`);
       }
     });
+
+    // Force token refresh if access token is likely expired
+    // (This is a proactive check before making the API call)
+    try {
+      await oauth2Client.getAccessToken();
+    } catch (refreshError) {
+      console.error(
+        `Failed to refresh token for ${account.name}:`,
+        refreshError.message
+      );
+      throw new Error(
+        `YouTube authentication failed for ${account.name}. Please regenerate tokens using youtube-service.js`
+      );
+    }
 
     const youtube = google.youtube({
       version: "v3",
@@ -1951,19 +2622,32 @@ async function uploadToYouTube(
   } catch (error) {
     // Provide more detailed error messages
     let errorMsg = error.message;
-    if (error.code === 401) {
-      errorMsg =
-        "Authentication failed. Access token may be invalid or expired.";
+    let helpText = "";
+
+    if (
+      error.code === 401 ||
+      error.message.includes("invalid authentication")
+    ) {
+      errorMsg = "Authentication failed. Access token expired or invalid.";
+      helpText = "\n💡 Fix: Run 'node youtube-service.js' to regenerate tokens";
     } else if (error.code === 403) {
       errorMsg =
         "Permission denied. Check YouTube API quota or channel permissions.";
+      helpText =
+        "\n💡 Check: https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas";
     } else if (error.code === 400) {
       errorMsg = "Bad request. Video file may be invalid or too large.";
+    } else if (error.message.includes("refresh token")) {
+      errorMsg =
+        "Failed to refresh access token. Refresh token may be invalid.";
+      helpText = "\n💡 Fix: Run 'node youtube-service.js' to regenerate tokens";
     }
+
+    console.error(`❌ YouTube upload error for ${account.name}:`, error);
 
     await logToDiscord(
       channel,
-      `❌ YouTube upload failed for ${account.name}: ${errorMsg}`,
+      `❌ YouTube upload failed for ${account.name}: ${errorMsg}${helpText}`,
       "error"
     );
     throw error;
@@ -2058,19 +2742,38 @@ async function postToInstagram(
       const maxDownloadAttempts = 3;
 
       while (!downloadSuccess && downloadAttempts < maxDownloadAttempts) {
+        let writer = null;
+        let videoResponse = null;
+
         try {
           downloadAttempts++;
-          const writer = fs.createWriteStream(localVideoPath);
-          const videoResponse = await axios.get(videoUrl, {
+          writer = fs.createWriteStream(localVideoPath);
+          videoResponse = await axios.get(videoUrl, {
             responseType: "stream",
             timeout: 60000, // 60 second timeout
           });
           videoResponse.data.pipe(writer);
 
-          await new Promise((resolve, reject) => {
-            writer.on("finish", resolve);
-            writer.on("error", reject);
-          });
+          // Add timeout for the write operation
+          let writeTimeout;
+          await Promise.race([
+            new Promise((resolve, reject) => {
+              writer.on("finish", () => {
+                clearTimeout(writeTimeout);
+                resolve();
+              });
+              writer.on("error", (err) => {
+                clearTimeout(writeTimeout);
+                reject(err);
+              });
+            }),
+            new Promise((_, reject) => {
+              writeTimeout = setTimeout(
+                () => reject(new Error("Write timeout")),
+                120000
+              );
+            }),
+          ]);
 
           downloadSuccess = true;
           await logToDiscord(
@@ -2087,7 +2790,9 @@ async function postToInstagram(
             if (videoResponse?.data) videoResponse.data.destroy();
           } catch (e) {}
           if (fs.existsSync(localVideoPath)) {
-            fs.unlinkSync(localVideoPath);
+            try {
+              fs.unlinkSync(localVideoPath);
+            } catch (e) {}
           }
           if (downloadAttempts === maxDownloadAttempts) {
             throw new Error(
@@ -2182,8 +2887,14 @@ async function postToInstagram(
 
       let isReady = false;
       let retries = 30; // Increased from 20 to 30 for more patience
+      const pollingStartTime = Date.now();
+      const MAX_POLLING_TIME = 300000; // 5 minutes maximum
 
       while (!isReady && retries > 0) {
+        // Check overall timeout
+        if (Date.now() - pollingStartTime > MAX_POLLING_TIME) {
+          throw new Error(`Instagram processing timeout after 5 minutes`);
+        }
         try {
           const checkDelay = Math.floor(Math.random() * 8000) + 5000; // Increased delay range
           await delay(checkDelay);
@@ -2338,13 +3049,32 @@ async function postToInstagram(
     } catch (error) {
       lastError = error;
 
-      // Clean up video file on error
-      const localVideoPath = path.join(
+      // Clean up video file on error - use the actual path from this attempt
+      const errorVideoPath = path.join(
         "videos",
         `instagram_upload_${Date.now()}_${attempt}.mp4`
       );
-      if (fs.existsSync(localVideoPath)) {
-        fs.unlinkSync(localVideoPath);
+      // Also try to clean up the file that was actually created
+      try {
+        const videosDir = path.join(__dirname, "videos");
+        if (fs.existsSync(videosDir)) {
+          const files = fs.readdirSync(videosDir);
+          const attemptFiles = files.filter(
+            (f) =>
+              f.startsWith("instagram_upload_") && f.includes(`_${attempt}.mp4`)
+          );
+          attemptFiles.forEach((f) => {
+            const fullPath = path.join(videosDir, f);
+            try {
+              if (fs.existsSync(fullPath)) {
+                fs.unlinkSync(fullPath);
+                console.log(`🧹 Cleaned up failed upload file: ${f}`);
+              }
+            } catch (e) {}
+          });
+        }
+      } catch (e) {
+        console.error(`Failed to cleanup error files: ${e.message}`);
       }
 
       await logToDiscord(
@@ -2437,6 +3167,33 @@ function generateRandomDeviceId() {
   const crypto = require("crypto");
   return crypto.randomBytes(8).toString("hex"); // 16 hex characters
 }
+
+// Global error handlers to prevent crashes
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ Unhandled Promise Rejection:", reason);
+  console.error("Promise:", promise);
+  // Don't exit, just log - the bot should keep running
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("❌ Uncaught Exception:", error);
+  console.error("Stack:", error.stack);
+
+  // For uncaught exceptions, we should exit gracefully
+  // Give cleanup 5 seconds max, then force exit
+  const forceExitTimeout = setTimeout(() => {
+    console.error("⚠️ Cleanup timeout, forcing exit");
+    process.exit(1);
+  }, 5000);
+
+  geminiService
+    .cleanup()
+    .catch((err) => console.error("Cleanup error:", err))
+    .finally(() => {
+      clearTimeout(forceExitTimeout);
+      process.exit(1);
+    });
+});
 
 // Graceful shutdown handlers
 process.on("SIGINT", async () => {

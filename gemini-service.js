@@ -57,7 +57,7 @@ IdolChat is where collecting meets connection - a revolutionary app that combine
 Core Features:
 • Chat with AI characters that remember your stories, jokes, and dreams
 • Collect character cards (3M+ cards collected by 3K+ users)
-• Free card drops every 8 minutes - choose from 2 random characters
+• Free card drops every 30 minutes - choose from 2 random characters
 • Create unlimited AI characters instantly (anime, K-pop idols, K-drama stars, gaming champions, custom)
 • Characters have contextual memory, emotion-aware responses, and evolving personalities
 • Social features: follow users, DM collectors, share characters (Instagram-like)
@@ -86,7 +86,7 @@ YOUR CAPTION STYLE:
 
 CAPTION ANGLES TO USE:
 • "Conversations that matter" - AI that remembers you
-• "Free card drops every 8 minutes" - collecting aspect
+• "Free card drops every 30 minutes" - collecting aspect
 • "Create any character" - K-pop idols, anime heroes, K-drama stars
 • "3M+ cards collected" - social proof
 • "Start free forever" - no commitment
@@ -111,7 +111,7 @@ IdolChat is where collecting meets connection - a revolutionary app that combine
 Core Features:
 • Chat with AI characters that remember your stories and develop real bonds
 • Collect character cards (3M+ cards collected, 3K+ active users)
-• Free card drops every 8 minutes
+• Free card drops every 30 minutes
 • Create unlimited AI characters: K-pop idols (BLACKPINK, BTS), K-drama stars, anime heroes (Naruto, JJK), gaming champions (Genshin, LoL), or custom
 • Characters have contextual memory, emotion-aware responses, evolving personalities
 • Social features: follow users, DM collectors, share characters
@@ -147,7 +147,7 @@ DESCRIPTION STRATEGY (200-400 chars):
 - Hashtags: #kpop #kdrama #ai #idolchat #viral
 
 DESCRIPTION ANGLES TO ROTATE:
-• "Chat with AI K-pop idols on IdolChat - free card drops every 8 minutes"
+• "Chat with AI K-pop idols on IdolChat - free card drops every 30 minutes"
 • "Create your own AI characters on IdolChat - K-drama stars, anime heroes, anyone"
 • "3K+ users collecting AI character cards on IdolChat - join free"
 • "Better than c.ai - IdolChat combines chat with card collecting"
@@ -209,7 +209,9 @@ class GeminiCaptionService {
         `🧹 Cleaning up ${this.uploadedFiles.size} uploaded files...`
       );
       const fileManager = new GoogleAIFileManager(process.env.GEMINI_API_KEY);
-      for (const fileName of this.uploadedFiles) {
+      // Convert to array to avoid modifying Set during iteration
+      const filesToDelete = Array.from(this.uploadedFiles);
+      for (const fileName of filesToDelete) {
         try {
           await fileManager.deleteFile(fileName);
           this.uploadedFiles.delete(fileName);
@@ -565,7 +567,7 @@ Example:
 - Original: "This dance cover took 50 takes 😭"
 - Video: K-pop dance performance
 - Title: "When K-pop Choreography Hits Different 🔥 | IdolChat"
-- Description: "This dance took 50 takes but the result is 🔥 Chat with K-pop AI idols on IdolChat - free card drops every 8 minutes! Better than c.ai. Credit: @${author} #kpop #dance #idolchat"
+- Description: "This dance took 50 takes but the result is 🔥 Chat with K-pop AI idols on IdolChat - free card drops every 30 minutes! Better than c.ai. Credit: @${author} #kpop #dance #idolchat"
 
 Generate ONLY in the format shown above. No extra text.`;
 

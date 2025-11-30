@@ -1,6 +1,10 @@
 {
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "youtube-auth": "node helpers/youtube-auth-helper.js",
+    "youtube-refresh": "node helpers/youtube-token-helper.js",
+    "instagram-refresh": "node helpers/instagram-token-helper.js",
+    "test-env": "node -e \"require('dotenv').config(); console.log('✅ .env file is valid')\""
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

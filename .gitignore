@@ -1,5 +1,8 @@
 # Environment variables
 .env
+.env.lock
+.env.backup
+.env.tmp
 
 # Node modules
 node_modules/

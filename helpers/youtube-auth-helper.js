@@ -77,13 +77,6 @@ const server = http.createServer(async (req, res) => {
       console.log(new Date(tokens.expiry_date).toLocaleString());
       console.log("\n");
 
-      // Auto-update .env file safely
-      const newAccount = {
-        name: "My Channel",
-        accessToken: tokens.access_token,
-        refreshToken: tokens.refresh_token,
-      };
-
       // Parse existing YouTube accounts
       let existingAccounts = [];
       try {
@@ -92,15 +85,28 @@ const server = http.createServer(async (req, res) => {
         existingAccounts = [];
       }
 
-      // Add new account (or replace if "My Channel" already exists)
-      const existingIndex = existingAccounts.findIndex(
-        (acc) => acc.name === "My Channel"
-      );
-      if (existingIndex >= 0) {
-        existingAccounts[existingIndex] = newAccount;
-      } else {
-        existingAccounts.push(newAccount);
+      // Find next available channel number
+      let channelNumber = 1;
+      const existingNumbers = existingAccounts
+        .map((acc) => {
+          const match = acc.name.match(/^My Channel (\d+)$/);
+          return match ? parseInt(match[1]) : null;
+        })
+        .filter((num) => num !== null);
+
+      if (existingNumbers.length > 0) {
+        channelNumber = Math.max(...existingNumbers) + 1;
       }
+
+      // Auto-update .env file safely
+      const newAccount = {
+        name: `My Channel ${channelNumber}`,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+      };
+
+      // Add new account
+      existingAccounts.push(newAccount);
 
       const result = await envUpdater.updateEnvFile(
         "YOUTUBE_ACCOUNTS",

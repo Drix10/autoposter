@@ -153,7 +153,7 @@ class EnvUpdater {
       const sanitizedAccounts = this.sanitizeAccounts(accounts);
 
       // Validate JSON
-      const jsonString = JSON.stringify(sanitizedAccounts);
+      const jsonString = JSON.stringify(sanitizedAccounts, null, 0); // Single line for .env compatibility
       this.validateJSON(jsonString);
 
       // Acquire lock

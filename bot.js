@@ -2549,7 +2549,7 @@ async function uploadToYouTube(
     });
 
     // Auto-refresh access token when it expires
-    oauth2Client.on("tokens", (tokens) => {
+    oauth2Client.on("tokens", async (tokens) => {
       if (tokens.refresh_token) {
         account.refreshToken = tokens.refresh_token;
         console.log(`🔄 New refresh token for ${account.name}`);
@@ -2557,6 +2557,22 @@ async function uploadToYouTube(
       if (tokens.access_token) {
         account.accessToken = tokens.access_token;
         console.log(`🔄 Access token refreshed for ${account.name}`);
+      }
+
+      // Persist updated tokens to .env file
+      try {
+        const envUpdater = require("./helpers/env-updater");
+        const result = await envUpdater.updateEnvFile(
+          "YOUTUBE_ACCOUNTS",
+          YOUTUBE_ACCOUNTS
+        );
+        if (result.success) {
+          console.log(`✅ Tokens persisted to .env for ${account.name}`);
+        } else {
+          console.warn(`⚠️ Could not persist tokens to .env: ${result.error}`);
+        }
+      } catch (persistError) {
+        console.warn(`⚠️ Failed to persist tokens: ${persistError.message}`);
       }
     });
 

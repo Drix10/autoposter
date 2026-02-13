@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits } = require("discord.js");
 const axios = require("axios");
+const envUpdater = require("./helpers/env-updater");
 
 const fs = require("fs");
 const path = require("path");
@@ -49,7 +50,7 @@ const YOUTUBE_ACCOUNTS = JSON.parse(process.env.YOUTUBE_ACCOUNTS || "[]");
 // Validate required environment variables
 if (!DISCORD_TOKEN || !CHANNEL_ID) {
   console.error(
-    "❌ Missing required environment variables: DISCORD_TOKEN, CHANNEL_ID"
+    "❌ Missing required environment variables: DISCORD_TOKEN, CHANNEL_ID",
   );
   process.exit(1);
 }
@@ -66,7 +67,7 @@ if (!process.env.GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set - AI captions will be disabled");
   console.warn("   Add GEMINI_API_KEY to .env to enable AI-powered captions");
   console.warn(
-    "   Get your free API key from: https://aistudio.google.com/app/apikey"
+    "   Get your free API key from: https://aistudio.google.com/app/apikey",
   );
 }
 
@@ -135,9 +136,242 @@ const FILE_LIMITS = {
   INSTAGRAM_CAPTION_MAX: 2200, // Instagram caption character limit
 };
 
-client.once("ready", () => {
+client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
+
+  // Auto-refresh Instagram tokens on startup
+  // Note: Tokens are refreshed intelligently - if recently refreshed (<5 min ago), skips refresh
+  try {
+    await autoRefreshInstagramTokens();
+  } catch (error) {
+    console.error(`❌ Critical error during token refresh: ${error.message}`);
+    console.error(
+      "⚠️  Bot will continue, but uploads may fail if tokens are expired",
+    );
+  }
 });
+
+/**
+ * Auto-refresh Instagram tokens on startup
+ * Extends token validity by 60 days if successful
+ *
+ * @throws {Error} If critical error occurs during refresh
+ */
+async function autoRefreshInstagramTokens() {
+  // Check if tokens were recently refreshed (within last 5 minutes)
+  const REFRESH_COOLDOWN = 5 * 60 * 1000; // 5 minutes
+  const timestampFile = path.join(__dirname, ".last-token-refresh");
+
+  try {
+    if (fs.existsSync(timestampFile)) {
+      const lastRefresh = parseInt(fs.readFileSync(timestampFile, "utf8"));
+      const timeSinceRefresh = Date.now() - lastRefresh;
+
+      if (timeSinceRefresh < REFRESH_COOLDOWN) {
+        const minutesAgo = Math.floor(timeSinceRefresh / 60000);
+        console.log(
+          `⏭️  Skipping token refresh (last refreshed ${minutesAgo} minute(s) ago)\n`,
+        );
+        return;
+      }
+    }
+  } catch (error) {
+    // If we can't read timestamp, proceed with refresh
+  }
+
+  console.log("\n🔄 Auto-refreshing Instagram tokens...");
+
+  // Reload environment variables to get latest tokens
+  delete require.cache[require.resolve("dotenv")];
+  require("dotenv").config();
+
+  let accounts;
+  try {
+    const accountsStr = process.env.INSTAGRAM_ACCOUNTS || "[]";
+    accounts = JSON.parse(accountsStr);
+
+    if (!Array.isArray(accounts)) {
+      throw new Error("INSTAGRAM_ACCOUNTS must be an array");
+    }
+  } catch (error) {
+    console.log(`⚠️  Could not parse Instagram accounts: ${error.message}`);
+    console.log("   Skipping token refresh");
+    return;
+  }
+
+  if (accounts.length === 0) {
+    console.log("⚠️  No Instagram accounts configured, skipping refresh");
+    return;
+  }
+
+  const updatedAccounts = [];
+  let refreshedCount = 0;
+  let failedCount = 0;
+  const REFRESH_TIMEOUT = 20000; // 20 seconds per account
+  const DELAY_BETWEEN_REQUESTS = 2000; // 2 seconds between requests to avoid rate limiting
+
+  for (let i = 0; i < accounts.length; i++) {
+    const account = accounts[i];
+    const accountName = account.name || `Account ${i + 1}`;
+
+    // Add delay between requests (except for first account)
+    if (i > 0) {
+      await delay(DELAY_BETWEEN_REQUESTS);
+    }
+
+    // Validate account structure
+    if (!account || typeof account !== "object") {
+      console.log(`⚠️  ${accountName}: Invalid account structure, skipping`);
+      updatedAccounts.push(account);
+      failedCount++;
+      continue;
+    }
+
+    if (!account.token) {
+      console.log(`⚠️  ${accountName}: Missing token, skipping`);
+      updatedAccounts.push(account);
+      failedCount++;
+      continue;
+    }
+
+    if (!account.id) {
+      console.log(`⚠️  ${accountName}: Missing Instagram ID, skipping`);
+      updatedAccounts.push(account);
+      failedCount++;
+      continue;
+    }
+
+    try {
+      // Create timeout promise
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("Request timeout")), REFRESH_TIMEOUT);
+      });
+
+      // Create refresh request promise
+      const refreshPromise = axios.get(
+        "https://graph.instagram.com/refresh_access_token",
+        {
+          params: {
+            grant_type: "ig_refresh_token",
+            access_token: account.token,
+          },
+          timeout: REFRESH_TIMEOUT - 1000, // Axios timeout slightly less than our timeout
+        },
+      );
+
+      // Race between timeout and actual request
+      const response = await Promise.race([refreshPromise, timeoutPromise]);
+
+      if (response.data && response.data.access_token) {
+        const newToken = response.data.access_token;
+        const expiresIn = response.data.expires_in;
+        const daysValid = Math.floor(expiresIn / 86400);
+
+        console.log(
+          `✅ ${accountName}: Token refreshed (valid for ${daysValid} days)`,
+        );
+
+        updatedAccounts.push({
+          name: account.name,
+          id: account.id,
+          token: newToken,
+        });
+        refreshedCount++;
+      } else {
+        console.log(
+          `⚠️  ${accountName}: Unexpected response format, keeping old token`,
+        );
+        updatedAccounts.push(account);
+        failedCount++;
+      }
+    } catch (error) {
+      // Extract detailed error information
+      let errorMsg = error.message;
+      let errorCode = null;
+      let httpStatus = null;
+
+      if (error.response) {
+        httpStatus = error.response.status;
+        errorCode = error.response.data?.error?.code;
+        errorMsg = error.response.data?.error?.message || error.message;
+
+        // Provide specific guidance based on error
+        if (httpStatus === 400 && errorCode === 190) {
+          errorMsg = "Token expired or invalid - needs manual regeneration";
+        } else if (httpStatus === 429) {
+          errorMsg = "Rate limit exceeded - too many refresh requests";
+        } else if (httpStatus === 403) {
+          errorMsg = "Permission denied - check app permissions";
+        }
+      }
+
+      console.log(`❌ ${accountName}: Refresh failed`);
+      console.log(`   Error: ${errorMsg}`);
+      if (httpStatus) console.log(`   HTTP Status: ${httpStatus}`);
+      if (errorCode) console.log(`   Error Code: ${errorCode}`);
+      console.log(`   → Keeping old token, but it may be expired`);
+
+      updatedAccounts.push(account);
+      failedCount++;
+    }
+  }
+
+  // Only update .env file if at least one token was successfully refreshed
+  if (refreshedCount > 0) {
+    try {
+      const result = await envUpdater.updateEnvFile(
+        "INSTAGRAM_ACCOUNTS",
+        updatedAccounts,
+      );
+
+      if (result.success) {
+        console.log(
+          `✅ Updated .env file with ${refreshedCount} refreshed token(s)`,
+        );
+
+        // Reload environment variables after update
+        delete require.cache[require.resolve("dotenv")];
+        require("dotenv").config();
+
+        // Write timestamp to prevent double-refresh
+        try {
+          const timestampFile = path.join(__dirname, ".last-token-refresh");
+          fs.writeFileSync(timestampFile, Date.now().toString(), "utf8");
+        } catch (tsError) {
+          // Non-critical error, just log it
+        }
+      } else {
+        console.log(`⚠️  Could not update .env file: ${result.error}`);
+        console.log(
+          "   Tokens were refreshed but not saved - they will expire in 1 hour",
+        );
+      }
+    } catch (error) {
+      console.log(`⚠️  Error updating .env file: ${error.message}`);
+      console.log(
+        "   Tokens were refreshed but not saved - they will expire in 1 hour",
+      );
+    }
+  } else if (failedCount === accounts.length) {
+    console.log("⚠️  All token refreshes failed - .env file not updated");
+  }
+
+  console.log(
+    `📊 Instagram token refresh: ${refreshedCount} succeeded, ${failedCount} failed\n`,
+  );
+
+  if (failedCount > 0) {
+    console.log(
+      "💡 Tip: Run 'npm run instagram-refresh' for detailed token status",
+    );
+
+    if (refreshedCount === 0) {
+      console.log("⚠️  WARNING: All tokens failed to refresh!");
+      console.log("   If tokens are expired, uploads will fail.");
+      console.log("   Generate new tokens: See SETUP_GUIDE.md\n");
+    }
+  }
+}
 
 async function retryUpload(uploadFunction, account, ...args) {
   let lastError = null;
@@ -148,7 +382,7 @@ async function retryUpload(uploadFunction, account, ...args) {
   for (let attempt = 1; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
     try {
       console.log(
-        `Upload attempt ${attempt}/${RETRY_CONFIG.maxRetries} for ${account.name}`
+        `Upload attempt ${attempt}/${RETRY_CONFIG.maxRetries} for ${account.name}`,
       );
       const result = await uploadFunction(account, ...args);
 
@@ -156,7 +390,7 @@ async function retryUpload(uploadFunction, account, ...args) {
         await logToDiscord(
           channel,
           `✅ Upload succeeded on attempt ${attempt} for ${account.name}`,
-          "success"
+          "success",
         );
       }
 
@@ -164,14 +398,14 @@ async function retryUpload(uploadFunction, account, ...args) {
     } catch (error) {
       lastError = error;
       console.log(
-        `Upload attempt ${attempt} failed for ${account.name}: ${error.message}`
+        `Upload attempt ${attempt} failed for ${account.name}: ${error.message}`,
       );
 
       if (attempt < RETRY_CONFIG.maxRetries) {
         const delay = Math.min(
           RETRY_CONFIG.baseDelay *
             Math.pow(RETRY_CONFIG.backoffMultiplier, attempt - 1),
-          RETRY_CONFIG.maxDelay
+          RETRY_CONFIG.maxDelay,
         );
 
         if (channel) {
@@ -180,7 +414,7 @@ async function retryUpload(uploadFunction, account, ...args) {
             `⚠️ Upload attempt ${attempt} failed for ${
               account.name
             }. Retrying in ${Math.round(delay / 1000)}s...`,
-            "warning"
+            "warning",
           );
         }
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -202,7 +436,7 @@ client.on("messageCreate", async (message) => {
 
   // Match Instagram URLs including both direct and username-based formats
   const reelUrlMatch = message.content.match(
-    /https?:\/\/(www\.)?instagram\.com\/(?:([^\/]+)\/)?(reels?|p)\/[\w-]+[^\s]*/
+    /https?:\/\/(www\.)?instagram\.com\/(?:([^\/]+)\/)?(reels?|p)\/[\w-]+[^\s]*/,
   );
   if (!reelUrlMatch) return;
 
@@ -236,11 +470,11 @@ client.on("messageCreate", async (message) => {
     try {
       const apiResponse = await axios.get(
         `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(
-          reelUrl
+          reelUrl,
         )}`,
         {
           timeout: TIMEOUTS.OEMBED_API,
-        }
+        },
       );
       if (apiResponse.data && apiResponse.data.author_name) {
         author = apiResponse.data.author_name;
@@ -265,9 +499,9 @@ client.on("messageCreate", async (message) => {
         .replace(
           new RegExp(
             `author:?\\s*${author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
-            "gi"
+            "gi",
           ),
-          ""
+          "",
         )
         .trim();
     }
@@ -278,7 +512,7 @@ client.on("messageCreate", async (message) => {
       console.log(
         `📝 Manual caption provided: "${manualCaption.substring(0, 80)}${
           manualCaption.length > 80 ? "..." : ""
-        }"`
+        }"`,
       );
       console.log(`📝 Full caption length: ${manualCaption.length} characters`);
     }
@@ -288,7 +522,7 @@ client.on("messageCreate", async (message) => {
 
   if (activeSessions.size >= MAX_CONCURRENT_SESSIONS) {
     await message.reply(
-      `⚠️ Server is currently processing ${activeSessions.size} reels. Please wait a moment and try again.`
+      `⚠️ Server is currently processing ${activeSessions.size} reels. Please wait a moment and try again.`,
     );
     return;
   }
@@ -296,7 +530,7 @@ client.on("messageCreate", async (message) => {
   const sessionId = `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   activeSessions.add(sessionId);
   console.log(
-    `Starting new session: ${sessionId} (Active: ${activeSessions.size}/${MAX_CONCURRENT_SESSIONS})`
+    `Starting new session: ${sessionId} (Active: ${activeSessions.size}/${MAX_CONCURRENT_SESSIONS})`,
   );
 
   try {
@@ -313,10 +547,10 @@ client.on("messageCreate", async (message) => {
       // 800MB threshold
       activeSessions.delete(sessionId);
       await message.reply(
-        `❌ Server memory critically high (${memUsageMB}MB). Please try again in a few minutes.`
+        `❌ Server memory critically high (${memUsageMB}MB). Please try again in a few minutes.`,
       );
       console.error(
-        `Session ${sessionId} rejected due to high memory: ${memUsageMB}MB`
+        `Session ${sessionId} rejected due to high memory: ${memUsageMB}MB`,
       );
       return;
     } else if (memUsage.heapUsed > 500 * 1024 * 1024) {
@@ -324,12 +558,12 @@ client.on("messageCreate", async (message) => {
     }
 
     console.log(
-      `Session ${sessionId}: System checks passed (Memory: ${memUsageMB}MB)`
+      `Session ${sessionId}: System checks passed (Memory: ${memUsageMB}MB)`,
     );
   } catch (diskError) {
     activeSessions.delete(sessionId);
     await message.reply(
-      "❌ System resources unavailable. Please try again later."
+      "❌ System resources unavailable. Please try again later.",
     );
     return;
   }
@@ -361,7 +595,7 @@ client.on("messageCreate", async (message) => {
         { name: "Author", value: author, inline: true },
         { name: "Session ID", value: sessionId, inline: true },
         { name: "Status", value: "⏳ Initializing…", inline: false },
-      ]
+      ],
     );
 
     await updateStatus(
@@ -371,13 +605,13 @@ client.on("messageCreate", async (message) => {
         { name: "URL", value: reelUrl, inline: true },
         { name: "Author", value: author, inline: true },
         { name: "Status", value: "⏳ Downloading…", inline: false },
-      ]
+      ],
     );
     const downloadResult = await downloadReel(
       reelUrl,
       sessionId,
       manualCaption,
-      isRepost
+      isRepost,
     );
     const videoPath = downloadResult.videoPath;
     const originalHashtags = downloadResult.originalHashtags;
@@ -435,7 +669,7 @@ client.on("messageCreate", async (message) => {
           console.log(`✅ Branding added for session: ${sessionId}`);
         } catch (brandingError) {
           console.error(
-            `⚠️ Branding failed for session ${sessionId}: ${brandingError.message}`
+            `⚠️ Branding failed for session ${sessionId}: ${brandingError.message}`,
           );
           finalPath = cleanedPath; // Fallback to cleaned video without branding
         }
@@ -446,7 +680,7 @@ client.on("messageCreate", async (message) => {
     } catch (processingError) {
       console.error(
         `Processing error for session ${sessionId}:`,
-        processingError.message
+        processingError.message,
       );
       finalPath = videoPath; // Fallback to original video
     }
@@ -473,7 +707,7 @@ client.on("messageCreate", async (message) => {
         await logToDiscord(
           message.channel,
           `📹 Uploading video to AI for analysis...`,
-          "info"
+          "info",
         );
 
         geminiVideoFile = await geminiService.uploadVideoForAnalysis(finalPath);
@@ -483,7 +717,7 @@ client.on("messageCreate", async (message) => {
         await logToDiscord(
           message.channel,
           `🤖 Generating Instagram caption...`,
-          "info"
+          "info",
         );
 
         aiGeneratedCaption =
@@ -491,13 +725,13 @@ client.on("messageCreate", async (message) => {
             originalCaption,
             author,
             originalHashtags,
-            geminiVideoFile
+            geminiVideoFile,
           );
 
         console.log(
           `✨ Instagram caption generated (${
             aiGeneratedCaption.length
-          } chars): ${aiGeneratedCaption.substring(0, 100)}...`
+          } chars): ${aiGeneratedCaption.substring(0, 100)}...`,
         );
 
         // Step 3: Generate YouTube metadata using SAME uploaded video
@@ -505,7 +739,7 @@ client.on("messageCreate", async (message) => {
           await logToDiscord(
             message.channel,
             `🤖 Generating YouTube metadata...`,
-            "info"
+            "info",
           );
 
           const ytMetadata =
@@ -513,7 +747,7 @@ client.on("messageCreate", async (message) => {
               originalCaption,
               author,
               originalHashtags,
-              geminiVideoFile
+              geminiVideoFile,
             );
 
           ytTitle = ytMetadata.title;
@@ -532,12 +766,12 @@ client.on("messageCreate", async (message) => {
         await logToDiscord(
           message.channel,
           `⚠️ AI caption generation failed: ${error.message}`,
-          "warning"
+          "warning",
         );
         await logToDiscord(
           message.channel,
           `Using fallback captions for all accounts`,
-          "info"
+          "info",
         );
 
         // Clean up video file if it was uploaded
@@ -570,7 +804,7 @@ client.on("messageCreate", async (message) => {
             },
             { name: "Status", value: "⏳ Publishing…", inline: false },
           ],
-          0xf1c40f
+          0xf1c40f,
         );
 
         await retryUpload(
@@ -584,19 +818,19 @@ client.on("messageCreate", async (message) => {
           originalCaption,
           isRepost,
           3, // maxRetries
-          aiGeneratedCaption // Pass the pre-generated caption
+          aiGeneratedCaption, // Pass the pre-generated caption
         );
         completedUploads++;
       } catch (error) {
         await logToDiscord(
           message.channel,
           `❌ All retry attempts failed for ${account.name}: ${error.message}`,
-          "error"
+          "error",
         );
         await logToDiscord(
           message.channel,
           `Skipping to the next account...`,
-          "info"
+          "info",
         );
       }
       // Only delay if not the last account
@@ -618,7 +852,7 @@ client.on("messageCreate", async (message) => {
           ? originalCaption
           : `${BASE_CAPTION.replace("%author%", author).replace(
               "%originalCaption%",
-              originalCaption || "No caption available"
+              originalCaption || "No caption available",
             )}`;
     }
 
@@ -640,7 +874,7 @@ client.on("messageCreate", async (message) => {
             },
             { name: "Status", value: "⏳ Uploading…", inline: false },
           ],
-          0xff0000
+          0xff0000,
         );
 
         await uploadToYouTube(
@@ -649,19 +883,19 @@ client.on("messageCreate", async (message) => {
           ytTitle,
           ytDescription,
           ytTags,
-          message.channel
+          message.channel,
         );
         completedYouTubeUploads++;
       } catch (error) {
         await logToDiscord(
           message.channel,
           `❌ YouTube upload failed for ${ytAccount.name}: ${error.message}`,
-          "error"
+          "error",
         );
         await logToDiscord(
           message.channel,
           `Skipping to the next YouTube account...`,
-          "info"
+          "info",
         );
       }
       // Only delay if not the last account
@@ -734,7 +968,7 @@ client.on("messageCreate", async (message) => {
           if (error.code !== "ENOENT") {
             console.error(
               `Failed to delete ${path.basename(file)}:`,
-              error.message
+              error.message,
             );
           }
         }
@@ -743,14 +977,14 @@ client.on("messageCreate", async (message) => {
     } catch (cleanupError) {
       console.error(
         `Cleanup error for session ${sessionId}:`,
-        cleanupError.message
+        cleanupError.message,
       );
     } finally {
       // Only delete session here, not in try block (prevents race condition)
       if (activeSessions.has(sessionId)) {
         activeSessions.delete(sessionId);
         console.log(
-          `Session ${sessionId} completed. Active sessions: ${activeSessions.size}`
+          `Session ${sessionId} completed. Active sessions: ${activeSessions.size}`,
         );
       }
     }
@@ -785,7 +1019,7 @@ client.on("messageCreate", async (message) => {
           },
           { name: "Author", value: author, inline: true },
         ],
-        0xe74c3c
+        0xe74c3c,
       );
     } else if (
       instagramFailed ||
@@ -812,13 +1046,13 @@ client.on("messageCreate", async (message) => {
             name: "Time Taken",
             value: statusMsg
               ? `${Math.round(
-                  (Date.now() - statusMsg.createdTimestamp) / 1000
+                  (Date.now() - statusMsg.createdTimestamp) / 1000,
                 )}s`
               : "N/A",
             inline: true,
           },
         ],
-        0xf39c12
+        0xf39c12,
       );
     } else {
       await updateStatus(
@@ -840,20 +1074,20 @@ client.on("messageCreate", async (message) => {
             name: "Time Taken",
             value: statusMsg
               ? `${Math.round(
-                  (Date.now() - statusMsg.createdTimestamp) / 1000
+                  (Date.now() - statusMsg.createdTimestamp) / 1000,
                 )}s`
               : "N/A",
             inline: true,
           },
         ],
-        0x2ecc71
+        0x2ecc71,
       );
     }
   } catch (error) {
     await logToDiscord(
       message.channel,
       `Error in session ${sessionId}: ${error.message}`,
-      "error"
+      "error",
     );
     console.error(`Process failed for session ${sessionId}:`, error);
 
@@ -907,7 +1141,7 @@ client.on("messageCreate", async (message) => {
           if (cleanupErr.code !== "ENOENT") {
             console.error(
               `Failed to delete ${path.basename(file)}:`,
-              cleanupErr.message
+              cleanupErr.message,
             );
           }
         }
@@ -915,7 +1149,7 @@ client.on("messageCreate", async (message) => {
     } catch (cleanupError) {
       console.error(
         `Cleanup error for session ${sessionId}:`,
-        cleanupError.message
+        cleanupError.message,
       );
     }
   } finally {
@@ -923,7 +1157,7 @@ client.on("messageCreate", async (message) => {
     if (activeSessions.has(sessionId)) {
       activeSessions.delete(sessionId);
       console.log(
-        `Session ${sessionId} cleaned up after error. Active sessions: ${activeSessions.size}`
+        `Session ${sessionId} cleaned up after error. Active sessions: ${activeSessions.size}`,
       );
     }
   }
@@ -933,7 +1167,7 @@ async function downloadReel(
   instagramUrl,
   sessionId,
   manualCaption = "",
-  isRepost = false
+  isRepost = false,
 ) {
   if (
     !instagramUrl ||
@@ -944,7 +1178,7 @@ async function downloadReel(
   }
 
   const API_URL = `https://igdl-five.vercel.app/api/video?postUrl=${encodeURIComponent(
-    instagramUrl
+    instagramUrl,
   )}`;
 
   try {
@@ -974,7 +1208,7 @@ async function downloadReel(
       const timeoutPromise = new Promise((_, reject) => {
         captionTimeout = setTimeout(
           () => reject(new Error("Caption extraction timeout")),
-          TIMEOUTS.CAPTION_EXTRACTION
+          TIMEOUTS.CAPTION_EXTRACTION,
         );
       });
 
@@ -1008,11 +1242,11 @@ async function downloadReel(
           originalCaption.length
         } chars) for session: ${sessionId}
                 Preview: "${originalCaption.substring(0, 80)}${
-          originalCaption.length > 80 ? "..." : ""
-        }"
+                  originalCaption.length > 80 ? "..." : ""
+                }"
                 Hashtags found: ${originalHashtags.length} (${originalHashtags
-          .slice(0, 5)
-          .join(" ")}${originalHashtags.length > 5 ? "..." : ""})`);
+                  .slice(0, 5)
+                  .join(" ")}${originalHashtags.length > 5 ? "..." : ""})`);
       } else {
         originalCaption = "";
         originalHashtags = [];
@@ -1021,7 +1255,7 @@ async function downloadReel(
     } catch (captionError) {
       console.log(
         `Could not extract caption for session ${sessionId}:`,
-        captionError.message
+        captionError.message,
       );
     }
 
@@ -1099,7 +1333,7 @@ async function downloadReel(
             cleanup();
             fs.unlink(videoPath, () => {});
             reject(
-              new Error("Downloaded file is too small to be a valid video")
+              new Error("Downloaded file is too small to be a valid video"),
             );
             return;
           }
@@ -1131,7 +1365,7 @@ async function downloadReel(
               promiseResolved = true;
               console.error(
                 `Invalid video file for session ${sessionId}:`,
-                err?.message || "No streams found"
+                err?.message || "No streams found",
               );
               cleanup();
               fs.unlink(videoPath, () => {});
@@ -1140,7 +1374,7 @@ async function downloadReel(
             }
 
             const hasVideo = metadata.streams.some(
-              (s) => s.codec_type === "video"
+              (s) => s.codec_type === "video",
             );
             if (!hasVideo) {
               promiseResolved = true;
@@ -1185,7 +1419,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
   try {
     console.log(`Trying oEmbed API for session: ${sessionId}`);
     const oembedUrl = `https://www.instagram.com/api/v1/oembed/?url=${encodeURIComponent(
-      instagramUrl
+      instagramUrl,
     )}`;
 
     let oembedTimeout;
@@ -1202,7 +1436,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       new Promise((_, reject) => {
         oembedTimeout = setTimeout(
           () => reject(new Error("oEmbed timeout")),
-          TIMEOUTS.OEMBED_API
+          TIMEOUTS.OEMBED_API,
         );
       }),
     ]);
@@ -1211,7 +1445,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       const caption = String(oembedResponse.data.title);
       const hashtagMatches = caption.match(/#[\w\u0590-\u05ff]+/g) || [];
       console.log(
-        `oEmbed success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`
+        `oEmbed success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`,
       );
       return {
         caption: caption,
@@ -1251,7 +1485,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       new Promise((_, reject) => {
         altTimeout = setTimeout(
           () => reject(new Error("Alt API timeout")),
-          TIMEOUTS.ALT_API
+          TIMEOUTS.ALT_API,
         );
       }),
     ]);
@@ -1260,7 +1494,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       const caption = String(altResponse.data.caption);
       const hashtagMatches = caption.match(/#[\w\u0590-\u05ff]+/g) || [];
       console.log(
-        `Alt API success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`
+        `Alt API success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`,
       );
       return {
         caption: caption,
@@ -1270,7 +1504,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
   } catch (altApiError) {
     console.log(
       `Alternative API failed for session ${sessionId}:`,
-      altApiError.message
+      altApiError.message,
     );
   }
 
@@ -1297,7 +1531,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
       new Promise((_, reject) => {
         scrapingTimeout = setTimeout(
           () => reject(new Error("Scraping timeout")),
-          TIMEOUTS.SCRAPING
+          TIMEOUTS.SCRAPING,
         );
       }),
     ]);
@@ -1309,7 +1543,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
     // Try to find JSON data in script tags (with safety checks)
     try {
       const jsonMatches = htmlContent.match(
-        /<script type="application\/ld\+json"[^>]*>(.*?)<\/script>/gs
+        /<script type="application\/ld\+json"[^>]*>(.*?)<\/script>/gs,
       );
       if (jsonMatches && Array.isArray(jsonMatches)) {
         for (const jsonMatch of jsonMatches) {
@@ -1322,12 +1556,12 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
             const data = JSON.parse(jsonContent);
             if (data && (data.caption || data.description || data.name)) {
               const caption = String(
-                data.caption || data.description || data.name
+                data.caption || data.description || data.name,
               );
               const hashtagMatches =
                 caption.match(/#[\w\u0590-\u05ff]+/g) || [];
               console.log(
-                `Scraping success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`
+                `Scraping success: Found ${hashtagMatches.length} hashtags for session: ${sessionId}`,
               );
               return {
                 caption: caption,
@@ -1342,7 +1576,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
     } catch (jsonError) {
       console.log(
         `JSON parsing failed for session ${sessionId}:`,
-        jsonError.message
+        jsonError.message,
       );
     }
 
@@ -1367,7 +1601,7 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
         if (allHashtags.length > 0) {
           const uniqueHashtags = [...new Set(allHashtags)]; // Include all unique hashtags
           console.log(
-            `Meta scraping success: Found ${uniqueHashtags.length} hashtags for session: ${sessionId}`
+            `Meta scraping success: Found ${uniqueHashtags.length} hashtags for session: ${sessionId}`,
           );
           return {
             caption: "",
@@ -1378,18 +1612,18 @@ async function extractInstagramCaption(instagramUrl, sessionId) {
     } catch (metaError) {
       console.log(
         `Meta tag parsing failed for session ${sessionId}:`,
-        metaError.message
+        metaError.message,
       );
     }
   } catch (scrapingError) {
     console.log(
       `Scraping failed for session ${sessionId}:`,
-      scrapingError.message
+      scrapingError.message,
     );
   }
 
   console.log(
-    `All caption extraction methods failed for session: ${sessionId}`
+    `All caption extraction methods failed for session: ${sessionId}`,
   );
   throw new Error("Could not extract caption from any source");
 }
@@ -1469,7 +1703,7 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
         if (!probeCompleted && !promiseResolved) {
           promiseResolved = true;
           console.error(
-            `❌ FFprobe timeout in addPromoToVideo for session ${sessionId}`
+            `❌ FFprobe timeout in addPromoToVideo for session ${sessionId}`,
           );
           resolve(videoPath);
         }
@@ -1555,7 +1789,7 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
           if (!promiseResolved) {
             promiseResolved = true;
             console.error(
-              `❌ FFmpeg timeout in addPromoToVideo for session ${sessionId}`
+              `❌ FFmpeg timeout in addPromoToVideo for session ${sessionId}`,
             );
             try {
               if (cmd) cmd.kill("SIGKILL");
@@ -1626,7 +1860,7 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
             if (!promiseResolved) {
               promiseResolved = true;
               console.log(
-                `✅ Netflix-style text overlay added ${showStart}s→${showEnd}s: ${finalPath}`
+                `✅ Netflix-style text overlay added ${showStart}s→${showEnd}s: ${finalPath}`,
               );
               resolve(finalPath);
             }
@@ -1640,7 +1874,7 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
               } catch (killError) {
                 console.error(
                   "Failed to kill FFmpeg process:",
-                  killError.message
+                  killError.message,
                 );
               }
               // Clean up partial file
@@ -1650,7 +1884,7 @@ async function addPromoToVideo(videoPath, sessionId, opts = {}) {
                 } catch (e) {}
               }
               console.log(
-                `⚠️ Text overlay failed (${e.message}). Returning original.`
+                `⚠️ Text overlay failed (${e.message}). Returning original.`,
               );
               resolve(videoPath);
             }
@@ -1675,11 +1909,11 @@ async function stripAllMetadata(videoPath, sessionId) {
     const cleanedPath = path.join(
       __dirname,
       "videos",
-      `cleaned_${sessionId}.mp4`
+      `cleaned_${sessionId}.mp4`,
     );
 
     console.log(
-      `🧹 Processing video (1.1x + 2% brightness + bgmusic) for session: ${sessionId}`
+      `🧹 Processing video (1.1x + 2% brightness + bgmusic) for session: ${sessionId}`,
     );
 
     // Check for background music
@@ -1713,7 +1947,7 @@ async function stripAllMetadata(videoPath, sessionId) {
       }
 
       const videoStream = metadata.streams.find(
-        (s) => s.codec_type === "video"
+        (s) => s.codec_type === "video",
       );
       const hasAudio = metadata.streams.some((s) => s.codec_type === "audio");
       const videoWidth = videoStream?.width || 1920;
@@ -1734,7 +1968,7 @@ async function stripAllMetadata(videoPath, sessionId) {
         if (hasBgMusic) {
           // Trim background music to match sped-up video duration, then mix
           filterComplex.push(
-            `[1:a]atrim=0:${speedupDuration},volume=0.05[bgm]`
+            `[1:a]atrim=0:${speedupDuration},volume=0.05[bgm]`,
           );
           filterComplex.push("[a1][bgm]amix=inputs=2:duration=first[aout]");
         } else {
@@ -1809,7 +2043,7 @@ async function stripAllMetadata(videoPath, sessionId) {
           if (!promiseResolved) {
             promiseResolved = true;
             console.log(
-              `✅ Processed (1.1x + 2% + bgmusic) for session: ${sessionId}`
+              `✅ Processed (1.1x + 2% + bgmusic) for session: ${sessionId}`,
             );
             resolve(cleanedPath);
           }
@@ -1839,11 +2073,11 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
     const cleanedPath = path.join(
       __dirname,
       "videos",
-      `cleaned_${sessionId}.mp4`
+      `cleaned_${sessionId}.mp4`,
     );
 
     console.log(
-      `🧹 Processing video with modifications for session: ${sessionId}`
+      `🧹 Processing video with modifications for session: ${sessionId}`,
     );
 
     // Check if background music exists
@@ -1877,7 +2111,7 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
       // Don't proceed if promise already resolved by timeout
       if (promiseResolved) {
         console.warn(
-          `FFprobe completed after timeout for session ${sessionId}`
+          `FFprobe completed after timeout for session ${sessionId}`,
         );
         return;
       }
@@ -1886,17 +2120,17 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
         promiseResolved = true;
         console.error(
           `❌ Failed to probe video for session ${sessionId}:`,
-          err.message
+          err.message,
         );
         resolve(videoPath); // Fallback to original
         return;
       }
 
       const videoStream = metadata.streams.find(
-        (s) => s.codec_type === "video"
+        (s) => s.codec_type === "video",
       );
       const audioStream = metadata.streams.find(
-        (s) => s.codec_type === "audio"
+        (s) => s.codec_type === "audio",
       );
 
       if (!videoStream) {
@@ -1913,7 +2147,7 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
       console.log(
         `📹 Video info: ${videoWidth}x${videoHeight}, Audio: ${
           hasAudio ? "Yes" : "No"
-        }`
+        }`,
       );
 
       // Build complex filter for video modifications
@@ -1925,10 +2159,10 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
       // 2. Add white overlay at 2% opacity (use actual video dimensions)
       // Use blend filter instead of RGBA conversion - MUCH faster
       filterComplex.push(
-        `color=white:s=${videoWidth}x${videoHeight}:d=9999[white]`
+        `color=white:s=${videoWidth}x${videoHeight}:d=9999[white]`,
       );
       filterComplex.push(
-        "[v1][white]blend=all_mode=overlay:all_opacity=0.02[vout]"
+        "[v1][white]blend=all_mode=overlay:all_opacity=0.02[vout]",
       );
 
       // 3. Handle audio processing
@@ -2057,14 +2291,14 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
         .on("end", () => {
           clearTimeout(processingTimeout);
           console.log(
-            `✅ Video processed successfully for session: ${sessionId}`
+            `✅ Video processed successfully for session: ${sessionId}`,
           );
           console.log(`   - Sped up to 1.1x ✓`);
           console.log(`   - White overlay 2% opacity ✓`);
           console.log(
             `   - Background music ${
               hasBgMusic ? "5% volume ✓" : "skipped (no file)"
-            }`
+            }`,
           );
           console.log(`   - Metadata stripped ✓`);
           resolve(cleanedPath);
@@ -2073,7 +2307,7 @@ async function stripAllMetadata_OLD(videoPath, sessionId) {
           clearTimeout(processingTimeout);
           console.error(
             `❌ Video processing failed for session ${sessionId}:`,
-            err.message
+            err.message,
           );
           console.log(`⚠️ Using original video for session: ${sessionId}`);
 
@@ -2100,7 +2334,7 @@ async function processVideo(videoPath, sessionId) {
     const editedPath = path.join(
       __dirname,
       "videos",
-      `edited_reel_${sessionId}.mp4`
+      `edited_reel_${sessionId}.mp4`,
     );
 
     console.log(`Starting video processing for session: ${sessionId}`);
@@ -2109,12 +2343,12 @@ async function processVideo(videoPath, sessionId) {
       if (err)
         return reject(
           new Error(
-            `Failed to probe video for session ${sessionId}: ` + err.message
-          )
+            `Failed to probe video for session ${sessionId}: ` + err.message,
+          ),
         );
 
       const videoStream = metadata.streams.find(
-        (s) => s.codec_type === "video"
+        (s) => s.codec_type === "video",
       );
       if (!videoStream) return reject(new Error("No video stream found"));
 
@@ -2184,7 +2418,7 @@ async function processVideo(videoPath, sessionId) {
       let videoFilters = [];
       videoFilters.push(scaleFilter);
       videoFilters.push(
-        `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}:gamma=${gamma}`
+        `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}:gamma=${gamma}`,
       );
       videoFilters.push(`unsharp=5:5:0.8:3:3:0.4`);
       videoFilters.push(`hqdn3d=4:3:6:4.5`);
@@ -2201,7 +2435,7 @@ async function processVideo(videoPath, sessionId) {
             `[scaled]${padFilter}[padded]`,
             finalFilter,
           ],
-          "final"
+          "final",
         )
         .outputOptions([
           "-t",
@@ -2265,7 +2499,7 @@ async function processVideo(videoPath, sessionId) {
         // High-quality audio processing with enhancement filters
         command
           .audioFilter(
-            "highpass=f=80,lowpass=f=18000,dynaudnorm=g=3,acompressor=threshold=0.1:ratio=2:attack=5:release=50,equalizer=f=3000:width=1000:g=1"
+            "highpass=f=80,lowpass=f=18000,dynaudnorm=g=3,acompressor=threshold=0.1:ratio=2:attack=5:release=50,equalizer=f=3000:width=1000:g=1",
           )
           .outputOptions([
             "-map",
@@ -2285,21 +2519,21 @@ async function processVideo(videoPath, sessionId) {
         .output(editedPath)
         .on("end", () => {
           console.log(
-            `Video processing completed successfully for session: ${sessionId}`
+            `Video processing completed successfully for session: ${sessionId}`,
           );
           resolve(editedPath);
         })
         .on("error", (err) => {
           console.error(
             `Video processing failed for session ${sessionId}:`,
-            err.message
+            err.message,
           );
           reject(
             new Error(
               `Failed to process video for session ${sessionId}: `.concat(
-                err.message
-              )
-            )
+                err.message,
+              ),
+            ),
           );
         })
         .run();
@@ -2322,7 +2556,7 @@ async function uploadToGitHub(channel, filePath) {
     await logToDiscord(
       channel,
       `Uploading video to GitHub: ${fileName}`,
-      "info"
+      "info",
     );
 
     // Check file size
@@ -2335,14 +2569,14 @@ async function uploadToGitHub(channel, filePath) {
       throw new Error(
         `File too large (${fileSizeMB.toFixed(2)}MB). GitHub API limit is ${
           FILE_LIMITS.GITHUB_MAX_MB
-        }MB (accounting for base64 encoding overhead). Consider using Git LFS or alternative storage.`
+        }MB (accounting for base64 encoding overhead). Consider using Git LFS or alternative storage.`,
       );
     }
 
     await logToDiscord(
       channel,
       `File size: ${fileSizeMB.toFixed(2)}MB - Encoding to base64...`,
-      "info"
+      "info",
     );
 
     // Read and encode the video file
@@ -2352,7 +2586,7 @@ async function uploadToGitHub(channel, filePath) {
     await logToDiscord(
       channel,
       `Uploading to GitHub (this may take a moment)...`,
-      "info"
+      "info",
     );
 
     // Upload directly to repository with timeout handling
@@ -2370,7 +2604,7 @@ async function uploadToGitHub(channel, filePath) {
     const timeoutPromise = new Promise((_, reject) => {
       uploadTimeout = setTimeout(
         () => reject(new Error("Upload timeout after 2 minutes")),
-        TIMEOUTS.GITHUB_UPLOAD
+        TIMEOUTS.GITHUB_UPLOAD,
       );
     });
 
@@ -2388,7 +2622,7 @@ async function uploadToGitHub(channel, filePath) {
     await logToDiscord(
       channel,
       `✅ Video uploaded successfully! (${fileSizeMB.toFixed(2)}MB)`,
-      "success"
+      "success",
     );
 
     return rawUrl;
@@ -2396,21 +2630,21 @@ async function uploadToGitHub(channel, filePath) {
     await logToDiscord(
       channel,
       `GitHub upload failed: ${error.message}`,
-      "error"
+      "error",
     );
 
     // Provide more helpful error messages
     if (error.status === 500) {
       throw new Error(
-        `GitHub server error (500). File may be too large or GitHub is experiencing issues. Try again later.`
+        `GitHub server error (500). File may be too large or GitHub is experiencing issues. Try again later.`,
       );
     } else if (error.status === 422) {
       throw new Error(
-        `GitHub rejected the upload (422). File may exceed size limits or be invalid.`
+        `GitHub rejected the upload (422). File may exceed size limits or be invalid.`,
       );
     } else if (error.message.includes("timeout")) {
       throw new Error(
-        `Upload timed out. File may be too large for GitHub API.`
+        `Upload timed out. File may be too large for GitHub API.`,
       );
     }
 
@@ -2455,13 +2689,13 @@ async function postFirstComment(account, mediaId, channel) {
           "User-Agent": userAgent,
         },
         timeout: 30000, // 30 second timeout
-      }
+      },
     );
 
     await logToDiscord(
       channel,
       `Posted first comment on ${account.name}'s reel.`,
-      "success"
+      "success",
     );
   } catch (error) {
     await logToDiscord(
@@ -2469,7 +2703,7 @@ async function postFirstComment(account, mediaId, channel) {
       `Failed to post first comment for ${account.name}: ${
         error.response?.data?.error?.message || error.message
       }`,
-      "warning"
+      "warning",
     );
   }
 }
@@ -2480,14 +2714,14 @@ async function uploadToYouTube(
   title,
   description,
   tags,
-  channel
+  channel,
 ) {
   let readStream = null;
   try {
     await logToDiscord(
       channel,
       `Starting YouTube upload for ${account.name}...`,
-      "info"
+      "info",
     );
 
     // Validate and truncate title (YouTube limit: 100 characters) at word boundary
@@ -2533,14 +2767,15 @@ async function uploadToYouTube(
 
     if (!account.accessToken || !account.refreshToken) {
       throw new Error(
-        `YouTube account ${account.name} missing access or refresh token`
+        `YouTube account ${account.name} missing access or refresh token`,
       );
     }
 
     const oauth2Client = new google.auth.OAuth2(
       process.env.YOUTUBE_CLIENT_ID,
       process.env.YOUTUBE_CLIENT_SECRET,
-      process.env.YOUTUBE_REDIRECT_URI || "http://localhost:3000/oauth2callback"
+      process.env.YOUTUBE_REDIRECT_URI ||
+        "http://localhost:3000/oauth2callback",
     );
 
     oauth2Client.setCredentials({
@@ -2564,7 +2799,7 @@ async function uploadToYouTube(
         const envUpdater = require("./helpers/env-updater");
         const result = await envUpdater.updateEnvFile(
           "YOUTUBE_ACCOUNTS",
-          YOUTUBE_ACCOUNTS
+          YOUTUBE_ACCOUNTS,
         );
         if (result.success) {
           console.log(`✅ Tokens persisted to .env for ${account.name}`);
@@ -2583,10 +2818,10 @@ async function uploadToYouTube(
     } catch (refreshError) {
       console.error(
         `Failed to refresh token for ${account.name}:`,
-        refreshError.message
+        refreshError.message,
       );
       throw new Error(
-        `YouTube authentication failed for ${account.name}. Please regenerate tokens using youtube-service.js`
+        `YouTube authentication failed for ${account.name}. Please regenerate tokens using youtube-service.js`,
       );
     }
 
@@ -2605,14 +2840,14 @@ async function uploadToYouTube(
       throw new Error(
         `Video file too large (${fileSizeGB.toFixed(2)}GB). YouTube limit is ${
           FILE_LIMITS.YOUTUBE_MAX_GB
-        }GB for unverified accounts.`
+        }GB for unverified accounts.`,
       );
     }
 
     await logToDiscord(
       channel,
       `Uploading ${fileSizeMB}MB to YouTube (${account.name})...`,
-      "info"
+      "info",
     );
 
     readStream = fs.createReadStream(videoPath);
@@ -2642,7 +2877,7 @@ async function uploadToYouTube(
     await logToDiscord(
       channel,
       `✅ Successfully uploaded to YouTube (${account.name}): ${videoUrl}`,
-      "success"
+      "success",
     );
 
     return videoUrl;
@@ -2675,7 +2910,7 @@ async function uploadToYouTube(
     await logToDiscord(
       channel,
       `❌ YouTube upload failed for ${account.name}: ${errorMsg}${helpText}`,
-      "error"
+      "error",
     );
     throw error;
   } finally {
@@ -2696,7 +2931,7 @@ async function postToInstagram(
   originalCaption = "",
   isRepost = false,
   maxRetries = 3,
-  preGeneratedCaption = null // NEW: Accept pre-generated AI caption
+  preGeneratedCaption = null, // NEW: Accept pre-generated AI caption
 ) {
   let attempt = 0;
   let lastError = null;
@@ -2708,7 +2943,7 @@ async function postToInstagram(
         await logToDiscord(
           channel,
           `🔄 Retry attempt ${attempt}/${maxRetries} for ${account.name}`,
-          "warning"
+          "warning",
         );
         // Exponential backoff: 30s, 60s, 120s
         const backoffDelay = Math.pow(2, attempt - 1) * 30000;
@@ -2742,19 +2977,19 @@ async function postToInstagram(
         `Preparing to upload to Instagram (${account.name})${
           isRepost ? " [REPOST MODE]" : ""
         }...`,
-        "info"
+        "info",
       );
       if (isRepost && originalCaption) {
         await logToDiscord(
           channel,
           `🔄 Using original caption (${originalCaption.length} chars) for ${account.name}`,
-          "info"
+          "info",
         );
       } else if (isRepost && !originalCaption) {
         await logToDiscord(
           channel,
           `⚠️ Repost mode but no original caption found, generating new caption for ${account.name}`,
-          "warning"
+          "warning",
         );
       }
       await delay(Math.floor(Math.random() * 5000) + 3000);
@@ -2762,7 +2997,7 @@ async function postToInstagram(
       // Download video with retry
       const localVideoPath = path.join(
         "videos",
-        `instagram_upload_${Date.now()}_${attempt}.mp4`
+        `instagram_upload_${Date.now()}_${attempt}.mp4`,
       );
       let downloadSuccess = false;
       let downloadAttempts = 0;
@@ -2797,7 +3032,7 @@ async function postToInstagram(
             new Promise((_, reject) => {
               writeTimeout = setTimeout(
                 () => reject(new Error("Write timeout")),
-                120000
+                120000,
               );
             }),
           ]);
@@ -2806,7 +3041,7 @@ async function postToInstagram(
           await logToDiscord(
             channel,
             `Video downloaded for direct upload to ${account.name}`,
-            "info"
+            "info",
           );
         } catch (downloadError) {
           // Clean up partial file and destroy stream
@@ -2823,7 +3058,7 @@ async function postToInstagram(
           }
           if (downloadAttempts === maxDownloadAttempts) {
             throw new Error(
-              `Failed to download video after ${maxDownloadAttempts} attempts: ${downloadError.message}`
+              `Failed to download video after ${maxDownloadAttempts} attempts: ${downloadError.message}`,
             );
           }
           await delay(5000); // Wait 5 seconds before retry
@@ -2849,7 +3084,7 @@ async function postToInstagram(
         caption =
           BASE_CAPTION.replace("%author%", author).replace(
             "%originalCaption%",
-            originalCaption || "No caption available"
+            originalCaption || "No caption available",
           ) +
           "\n\n" +
           generateHashtags().join(" ");
@@ -2860,7 +3095,7 @@ async function postToInstagram(
         caption =
           caption.substring(0, FILE_LIMITS.INSTAGRAM_CAPTION_MAX - 3) + "...";
         console.log(
-          `⚠️ Caption truncated to ${FILE_LIMITS.INSTAGRAM_CAPTION_MAX} chars for ${account.name}`
+          `⚠️ Caption truncated to ${FILE_LIMITS.INSTAGRAM_CAPTION_MAX} chars for ${account.name}`,
         );
       }
 
@@ -2893,7 +3128,7 @@ async function postToInstagram(
                 "X-IG-App-ID": "936619743392459",
               },
               timeout: 30000, // 30 second timeout
-            }
+            },
           );
           break; // Success, exit loop
         } catch (containerError) {
@@ -2934,7 +3169,7 @@ async function postToInstagram(
                 Accept: "application/json",
               },
               timeout: 15000, // 15 second timeout
-            }
+            },
           );
 
           const statusCode = checkStatus.data.status_code;
@@ -2950,7 +3185,7 @@ async function postToInstagram(
               await logToDiscord(
                 channel,
                 `Still processing for ${account.name}, ${retries} attempts remaining...`,
-                "info"
+                "info",
               );
             }
           } else {
@@ -2958,7 +3193,7 @@ async function postToInstagram(
             await logToDiscord(
               channel,
               `Processing status: ${statusCode} for ${account.name}, waiting...`,
-              "info"
+              "info",
             );
           }
         } catch (error) {
@@ -2966,7 +3201,7 @@ async function postToInstagram(
             await logToDiscord(
               channel,
               `Rate limited for ${account.name}, waiting 45 seconds...`,
-              "warning"
+              "warning",
             );
             await delay(45000); // Longer delay for rate limits
             retries--;
@@ -2974,7 +3209,7 @@ async function postToInstagram(
             await logToDiscord(
               channel,
               `Instagram server error for ${account.name}, waiting before retry...`,
-              "warning"
+              "warning",
             );
             await delay(15000);
             retries--;
@@ -2988,7 +3223,7 @@ async function postToInstagram(
         throw new Error(
           `Media processing timeout after ${
             30 - retries
-          } attempts. Instagram may be experiencing high load.`
+          } attempts. Instagram may be experiencing high load.`,
         );
       }
 
@@ -3017,7 +3252,7 @@ async function postToInstagram(
                 "X-IG-App-ID": "936619743392459",
               },
               timeout: 30000, // 30 second timeout
-            }
+            },
           );
           break; // Success, exit loop
         } catch (publishError) {
@@ -3041,7 +3276,7 @@ async function postToInstagram(
         await logToDiscord(
           channel,
           `⚠️ Failed to post first comment for ${account.name}: ${commentError.message}`,
-          "warning"
+          "warning",
         );
       }
 
@@ -3055,7 +3290,7 @@ async function postToInstagram(
             Accept: "application/json",
           },
           timeout: 15000, // 15 second timeout
-        }
+        },
       );
 
       const reelUrl = mediaInfo.data.permalink;
@@ -3070,7 +3305,7 @@ async function postToInstagram(
         `✅ Successfully posted to Instagram: ${account.name}${
           isRepost ? " [REPOST]" : ""
         }\nReel URL: ${reelUrl}`,
-        "success"
+        "success",
       );
       return reelUrl;
     } catch (error) {
@@ -3079,7 +3314,7 @@ async function postToInstagram(
       // Clean up video file on error - use the actual path from this attempt
       const errorVideoPath = path.join(
         "videos",
-        `instagram_upload_${Date.now()}_${attempt}.mp4`
+        `instagram_upload_${Date.now()}_${attempt}.mp4`,
       );
       // Also try to clean up the file that was actually created
       try {
@@ -3088,7 +3323,8 @@ async function postToInstagram(
           const files = fs.readdirSync(videosDir);
           const attemptFiles = files.filter(
             (f) =>
-              f.startsWith("instagram_upload_") && f.includes(`_${attempt}.mp4`)
+              f.startsWith("instagram_upload_") &&
+              f.includes(`_${attempt}.mp4`),
           );
           attemptFiles.forEach((f) => {
             const fullPath = path.join(videosDir, f);
@@ -3107,7 +3343,7 @@ async function postToInstagram(
       await logToDiscord(
         channel,
         `❌ Attempt ${attempt}/${maxRetries} failed for ${account.name}: ${error.message}`,
-        "error"
+        "error",
       );
 
       // Check if this is a non-retryable error
@@ -3115,7 +3351,7 @@ async function postToInstagram(
         await logToDiscord(
           channel,
           `🚫 Non-retryable error detected for ${account.name}, stopping attempts`,
-          "error"
+          "error",
         );
         break;
       }
@@ -3135,7 +3371,7 @@ async function postToInstagram(
       lastError?.response?.data?.error?.message ||
       lastError?.message ||
       "Unknown error"
-    }`
+    }`,
   );
 }
 

@@ -1,6 +1,7 @@
 {
   "scripts": {
-    "start": "npm run youtube-refresh && node bot.js",
+    "start": "npm run instagram-refresh && npm run youtube-refresh && node bot.js",
+    "start:direct": "node bot.js",
     "youtube-auth": "node helpers/youtube-auth-helper.js",
     "youtube-refresh": "node helpers/youtube-token-helper.js",
     "instagram-refresh": "node helpers/instagram-token-helper.js",

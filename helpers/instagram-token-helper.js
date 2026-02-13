@@ -5,6 +5,8 @@
  */
 
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 const envUpdater = require("./env-updater");
 require("dotenv").config();
 
@@ -29,7 +31,7 @@ async function refreshInstagramTokens() {
     console.log("⚠️  No Instagram accounts configured in .env file");
     console.log("\nAdd your accounts to .env:");
     console.log(
-      'INSTAGRAM_ACCOUNTS=[{"name":"account1","id":"instagram_id","token":"instagram_token"}]\n'
+      'INSTAGRAM_ACCOUNTS=[{"name":"account1","id":"instagram_id","token":"instagram_token"}]\n',
     );
     process.exit(0);
   }
@@ -74,8 +76,8 @@ async function refreshInstagramTokens() {
         console.log(`   Valid for: ${daysValid} days`);
         console.log(
           `   Expires on: ${new Date(
-            Date.now() + expiresIn * 1000
-          ).toLocaleDateString()}`
+            Date.now() + expiresIn * 1000,
+          ).toLocaleDateString()}`,
         );
 
         results.push({
@@ -149,7 +151,7 @@ async function refreshInstagramTokens() {
     // Auto-update .env file safely
     const result = await envUpdater.updateEnvFile(
       "INSTAGRAM_ACCOUNTS",
-      updatedAccounts
+      updatedAccounts,
     );
 
     if (result.success) {
@@ -159,13 +161,21 @@ async function refreshInstagramTokens() {
       console.log("Your .env file has been updated with the new tokens!");
       console.log("No need to copy/paste - you're all set! 🎉\n");
 
+      // Write timestamp to prevent double-refresh
+      try {
+        const timestampFile = path.join(__dirname, "..", ".last-token-refresh");
+        fs.writeFileSync(timestampFile, Date.now().toString(), "utf8");
+      } catch (tsError) {
+        // Non-critical error, just continue
+      }
+
       // Show expiry dates
       console.log("📅 Token Expiry Dates:");
       successAccounts.forEach((acc) => {
         console.log(
           `   ${acc.name}: ${acc.expiryDate.toLocaleDateString()} (${
             acc.daysValid
-          } days)`
+          } days)`,
         );
       });
       console.log("\n");

@@ -4,6 +4,9 @@
 .env.backup
 .env.tmp
 
+# Token refresh timestamp
+.last-token-refresh
+
 # Node modules
 node_modules/
 

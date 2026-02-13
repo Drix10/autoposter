@@ -274,15 +274,79 @@ INSTAGRAM_ACCOUNTS=[{"name":"kcore.editss","id":"17841472678183501","token":"IGA
 
 - **Short-lived tokens:** 1 hour (must be exchanged immediately)
 - **Long-lived tokens:** 60 days
-- **Refresh before expiration:** Set a reminder for day 50
+- **Auto-refresh on startup:** Tokens automatically refreshed when running `npm start`
+- **Manual refresh scripts:** Available for troubleshooting (`npm run instagram-refresh`)
 
-**To refresh a long-lived token (before it expires):**
+**Automatic Token Refresh (Recommended):**
+
+When you run `npm start`, the bot automatically:
+
+1. Runs `npm run instagram-refresh` helper script
+2. Refreshes all Instagram tokens via Instagram Graph API
+3. **Writes new tokens to your `.env` file on disk**
+4. Extends token validity by 60 days from refresh time
+5. Runs `npm run youtube-refresh` to refresh YouTube tokens
+6. Starts the Discord bot with fresh tokens
+
+**Smart Cooldown:** If tokens were refreshed within the last 5 minutes, the refresh is skipped to prevent rate limiting and unnecessary API calls.
+
+**Disk Write Behavior:**
+
+- ✅ Tokens are written to `.env` file automatically
+- ✅ Original `.env` file is backed up before writing (`.env.backup`)
+- ✅ Atomic write with file locking prevents corruption
+- ⚠️ **If `.env` is read-only:** Refresh will fail with a clear error message. Tokens will be refreshed in memory but NOT saved, meaning they expire in 1 hour instead of 60 days.
+
+**Security & Version Control:**
+
+- 🔒 **CRITICAL:** Keep `.env` out of version control (already in `.gitignore`)
+- 🔒 Review file permissions: `.env` should be readable/writable by bot user only
+- 🔒 Backup `.env` file securely (contains sensitive tokens)
+- 🔒 Never commit `.env.backup` or `.last-token-refresh` files
+
+**When Manual Intervention is Required:**
+
+- Token is completely expired (>60 days old) - cannot be refreshed, must regenerate
+- Token is revoked (user revoked app access) - must regenerate
+- App permissions changed - must regenerate with new permissions
+- `.env` file is read-only or locked - fix permissions or manually update
+- All automatic refresh attempts fail - use manual methods below
+
+**Manual Token Refresh (Fallback/Troubleshooting):**
+
+If automatic refresh fails or you need to manually verify tokens:
+
+```bash
+npm run instagram-refresh
+```
+
+This script does the same as the automatic refresh but with detailed output for debugging.
+
+**Manual Token Regeneration via Graph API:**
+
+If tokens are expired or revoked, you must manually regenerate them:
 
 ```
 https://graph.facebook.com/v18.0/oauth/access_token?grant_type=fb_exchange_token&client_id=YOUR_APP_ID&client_secret=YOUR_APP_SECRET&fb_exchange_token=YOUR_CURRENT_LONG_LIVED_TOKEN
 ```
 
-This gives you a new 60-day token. Update your .env file with the new token.
+**IMPORTANT:** When using the Graph API directly, you must **manually copy the new token** into your `.env` file. The automatic `.env` update only happens when running the bot or the `npm run instagram-refresh` script, not when using the Graph API URL directly in your browser.
+
+Response will look like:
+
+```json
+{
+  "access_token": "EAABsbCS1iHgBO7ZCZCvqn...",
+  "token_type": "bearer",
+  "expires_in": 5183944
+}
+```
+
+Copy the `access_token` value and manually update your `.env` file:
+
+```
+INSTAGRAM_ACCOUNTS=[{"name":"account1","id":"instagram_id","token":"PASTE_NEW_TOKEN_HERE"}]
+```
 
 #### Testing Your Instagram Token
 
@@ -309,14 +373,12 @@ If you get an error, the token is invalid or expired.
 ### GitHub Setup (Video Storage)
 
 1. **Create Personal Access Token**
-
    - Go to https://github.com/settings/tokens
    - Click "Generate new token (classic)"
    - Select scopes: `repo` (full control)
    - Generate and copy token
 
 2. **Create Repository**
-
    - Create a new repository for video storage
    - Can be public or private
 
@@ -666,18 +728,15 @@ node bot.js
 ## 🔒 Security Best Practices
 
 1. **Never commit .env file**
-
    - Already in `.gitignore`
    - Contains sensitive credentials
 
 2. **Rotate tokens regularly**
-
    - Instagram: Every 60 days
    - GitHub: Annually or when compromised
    - YouTube: Refresh tokens are long-lived
 
 3. **Use environment variables**
-
    - Never hardcode credentials in code
    - Use `.env` file for local development
    - Use platform secrets for production
@@ -877,19 +936,16 @@ This bot has been thoroughly reviewed and optimized:
 ### Recent Improvements:
 
 1. **Performance Optimization**
-
    - Removed slow `processVideo` function (saved 5-10 minutes per video)
    - Optimized FFmpeg settings (ultrafast preset)
    - Efficient stream handling
 
 2. **Memory Management**
-
    - Fixed all memory leaks in stream handling
    - Proper cleanup of FFmpeg processes
    - Centralized resource cleanup functions
 
 3. **Reliability**
-
    - Added timeouts to all FFmpeg operations (3 minutes)
    - Fixed race conditions with `promiseResolved` flags
    - Comprehensive error handlers with graceful fallbacks

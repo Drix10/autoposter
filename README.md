@@ -10,12 +10,35 @@ A Discord bot that automatically downloads Instagram reels, processes them with 
 - 📤 Upload to multiple Instagram accounts simultaneously
 - 📺 Upload to YouTube channels (optional)
 - 🔄 Automatic retry logic with exponential backoff
+- 🔑 Smart token refresh: Auto-refresh on startup + manual scripts available
 - 🧹 Smart file cleanup and memory management (zero memory leaks!)
 - ⚡ 10x faster video processing (30-90 seconds vs 5-10 minutes)
 - 🎥 Video enhancements: 1.1x speed, 2% brightness, background music
 - 📊 Real-time progress tracking in Discord
 - 🔒 Secure credential management with environment variables
 - 🛡️ Production-ready with comprehensive error handling
+
+## Token Management
+
+**Automatic Refresh (Recommended):**
+
+- Running `npm start` automatically refreshes both Instagram and YouTube tokens
+- Instagram tokens: Extended by 60 days on each refresh
+- YouTube tokens: New access tokens generated using refresh tokens
+- Tokens are written to `.env` file automatically
+- Smart cooldown: Skips refresh if done within last 5 minutes (prevents rate limiting)
+
+**Manual Refresh (For Troubleshooting):**
+
+- Instagram: `npm run instagram-refresh` - Use if automatic refresh fails or for manual verification
+- YouTube: `npm run youtube-refresh` - Use if automatic refresh fails or for manual verification
+
+**Refresh Frequency:**
+
+- No need to run manually if using `npm start` regularly
+- Instagram tokens valid for 60 days (auto-extended on each startup)
+- YouTube access tokens valid for 1 hour (auto-refreshed using long-lived refresh tokens)
+- If bot runs at least once per 60 days, Instagram tokens never expire
 
 ## Prerequisites
 

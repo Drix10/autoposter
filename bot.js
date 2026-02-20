@@ -1918,7 +1918,7 @@ async function stripAllMetadata(videoPath, sessionId) {
     );
 
     console.log(
-      `🧹 Processing video (1.1x + 2% brightness + bgmusic) for session: ${sessionId}`,
+      `🎨 Processing video (1.1x speed + viral color grading + 20% bgmusic) for session: ${sessionId}`,
     );
 
     // Check for background music
@@ -1964,24 +1964,34 @@ async function stripAllMetadata(videoPath, sessionId) {
 
       let filterComplex = [];
 
-      // 1. Speed up video + add 2% brightness (simpler than overlay)
-      filterComplex.push("[0:v]setpts=PTS/1.1,eq=brightness=0.02[vout]");
+      // 1. Speed up video + VIRAL COLOR GRADING for maximum engagement
+      // - Increased contrast (1.15) for punchier visuals
+      // - Boosted saturation (1.25) for vibrant, eye-catching colors
+      // - Slight brightness lift (0.04) for better visibility
+      // - Warm color balance for appealing skin tones
+      // - Sharpening for crisp details
+      filterComplex.push(
+        "[0:v]setpts=PTS/1.1," +
+          "eq=contrast=1.15:brightness=0.04:saturation=1.25:gamma=1.02," +
+          "colorbalance=rs=0.08:gs=0.02:bs=-0.04," +
+          "unsharp=5:5:1.0:3:3:0.5[vout]",
+      );
 
-      // 2. Audio processing
+      // 2. Audio processing with 20% background music
       if (hasAudio) {
         filterComplex.push("[0:a]atempo=1.1[a1]");
         if (hasBgMusic) {
-          // Trim background music to match sped-up video duration, then mix
+          // Trim background music to match sped-up video duration, then mix at 20% volume
           filterComplex.push(
-            `[1:a]atrim=0:${speedupDuration},volume=0.05[bgm]`,
+            `[1:a]atrim=0:${speedupDuration},volume=0.20[bgm]`,
           );
           filterComplex.push("[a1][bgm]amix=inputs=2:duration=first[aout]");
         } else {
           filterComplex.push("[a1]acopy[aout]");
         }
       } else if (hasBgMusic) {
-        // Trim background music to match sped-up video duration
-        filterComplex.push(`[1:a]atrim=0:${speedupDuration},volume=0.05[aout]`);
+        // Trim background music to match sped-up video duration at 20% volume
+        filterComplex.push(`[1:a]atrim=0:${speedupDuration},volume=0.20[aout]`);
       }
 
       const command = ffmpeg(videoPath);
@@ -2005,42 +2015,33 @@ async function stripAllMetadata(videoPath, sessionId) {
           }
           resolve(videoPath);
         }
-      }, 180000); // 3 minute timeout (increased from 2 for complex videos)
+      }, 180000); // 3 minutes
 
-      command.complexFilter(filterComplex.join(";")).outputOptions([
-        "-map",
-        "[vout]",
-        "-map_metadata",
-        "-1",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "23",
-        "-movflags",
-        "+faststart", // Enable fast start for better streaming
-      ]);
-
-      if (hasAudio || hasBgMusic) {
-        command.outputOptions([
+      command
+        .complexFilter(filterComplex.join(";"))
+        .outputOptions([
           "-map",
-          "[aout]",
+          "[vout]",
+          ...(hasAudio || hasBgMusic ? ["-map", "[aout]"] : []),
+          "-c:v",
+          "libx264",
+          "-preset",
+          "ultrafast",
+          "-crf",
+          "23",
+          "-pix_fmt",
+          "yuv420p",
           "-c:a",
           "aac",
           "-b:a",
           "192k",
-        ]);
-
-        // If only bgMusic, ensure it stops at video end
-        if (!hasAudio && hasBgMusic) {
-          command.outputOptions(["-shortest"]);
-        }
-      }
-
-      command
+          "-map_metadata",
+          "-1",
+          "-fflags",
+          "+bitexact",
+        ])
         .output(cleanedPath)
-        .on("start", (cmdLine) => {
+        .on("start", () => {
           console.log(`🎬 FFmpeg started for session: ${sessionId}`);
         })
         .on("end", () => {
@@ -2048,7 +2049,16 @@ async function stripAllMetadata(videoPath, sessionId) {
           if (!promiseResolved) {
             promiseResolved = true;
             console.log(
-              `✅ Processed (1.1x + 2% + bgmusic) for session: ${sessionId}`,
+              `✅ Processed (1.1x + viral grading + 20% bgmusic) for session: ${sessionId}`,
+            );
+            console.log(`   - Speed: 1.1x ✓`);
+            console.log(`   - Contrast: +15% (punchy) ✓`);
+            console.log(`   - Saturation: +25% (vibrant) ✓`);
+            console.log(`   - Brightness: +4% (lifted) ✓`);
+            console.log(`   - Color: Warm balance ✓`);
+            console.log(`   - Sharpness: Enhanced ✓`);
+            console.log(
+              `   - BG Music: ${hasBgMusic ? "20% volume ✓" : "skipped (no file)"}`,
             );
             resolve(cleanedPath);
           }
@@ -2058,7 +2068,6 @@ async function stripAllMetadata(videoPath, sessionId) {
           if (!promiseResolved) {
             promiseResolved = true;
             console.error(`❌ Processing failed: ${err.message}`);
-            // Clean up partial file
             if (fs.existsSync(cleanedPath)) {
               try {
                 fs.unlinkSync(cleanedPath);
@@ -2066,480 +2075,6 @@ async function stripAllMetadata(videoPath, sessionId) {
             }
             resolve(videoPath);
           }
-        })
-        .run();
-    });
-  });
-}
-
-// OLD COMPLEX VERSION - DISABLED
-async function stripAllMetadata_OLD(videoPath, sessionId) {
-  return new Promise((resolve, reject) => {
-    const cleanedPath = path.join(
-      __dirname,
-      "videos",
-      `cleaned_${sessionId}.mp4`,
-    );
-
-    console.log(
-      `🧹 Processing video with modifications for session: ${sessionId}`,
-    );
-
-    // Check if background music exists
-    const bgMusicPath = path.join(__dirname, "bg-music.mp3");
-    // TEMPORARILY DISABLED: Background music causing timeout issues
-    const hasBgMusic = false; // fs.existsSync(bgMusicPath);
-
-    if (!hasBgMusic) {
-      console.log(`⚠️ Background music disabled (testing)`);
-    }
-
-    let command = null; // Declare command variable in outer scope
-    let processingTimeout = null;
-    let probeCompleted = false;
-    let promiseResolved = false; // Track if promise already resolved
-
-    // Timeout for ffprobe itself
-    const probeTimeout = setTimeout(() => {
-      if (!probeCompleted && !promiseResolved) {
-        promiseResolved = true;
-        console.error(`❌ FFprobe timeout for session ${sessionId}`);
-        resolve(videoPath); // Fallback to original
-      }
-    }, 30000); // 30 second timeout for probe
-
-    // First probe the video to get dimensions and check for audio
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-      probeCompleted = true;
-      clearTimeout(probeTimeout);
-
-      // Don't proceed if promise already resolved by timeout
-      if (promiseResolved) {
-        console.warn(
-          `FFprobe completed after timeout for session ${sessionId}`,
-        );
-        return;
-      }
-
-      if (err) {
-        promiseResolved = true;
-        console.error(
-          `❌ Failed to probe video for session ${sessionId}:`,
-          err.message,
-        );
-        resolve(videoPath); // Fallback to original
-        return;
-      }
-
-      const videoStream = metadata.streams.find(
-        (s) => s.codec_type === "video",
-      );
-      const audioStream = metadata.streams.find(
-        (s) => s.codec_type === "audio",
-      );
-
-      if (!videoStream) {
-        promiseResolved = true;
-        console.error(`❌ No video stream found for session ${sessionId}`);
-        resolve(videoPath);
-        return;
-      }
-
-      const hasAudio = !!audioStream;
-      const videoWidth = videoStream.width || 1920;
-      const videoHeight = videoStream.height || 1080;
-
-      console.log(
-        `📹 Video info: ${videoWidth}x${videoHeight}, Audio: ${
-          hasAudio ? "Yes" : "No"
-        }`,
-      );
-
-      // Build complex filter for video modifications
-      let filterComplex = [];
-
-      // 1. Speed up video to 1.1x
-      filterComplex.push("[0:v]setpts=PTS/1.1[v1]");
-
-      // 2. Add white overlay at 2% opacity (use actual video dimensions)
-      // Use blend filter instead of RGBA conversion - MUCH faster
-      filterComplex.push(
-        `color=white:s=${videoWidth}x${videoHeight}:d=9999[white]`,
-      );
-      filterComplex.push(
-        "[v1][white]blend=all_mode=overlay:all_opacity=0.02[vout]",
-      );
-
-      // 3. Handle audio processing
-      if (hasAudio) {
-        // Speed up original audio to 1.1x
-        filterComplex.push("[0:a]atempo=1.1[a1]");
-
-        // 4. Mix with background music at 5% volume if available
-        if (hasBgMusic) {
-          // Background music is already looped via -stream_loop input option
-          // Just adjust volume and mix with shortest duration
-          filterComplex.push("[1:a]volume=0.05[bgm]");
-          filterComplex.push("[a1][bgm]amix=inputs=2:duration=shortest[aout]");
-        } else {
-          // Just use the sped-up audio
-          filterComplex.push("[a1]anull[aout]");
-        }
-      } else {
-        // No audio in original video
-        if (hasBgMusic) {
-          // Use only background music
-          // The -shortest output option will ensure audio matches video length
-          filterComplex.push("[1:a]volume=0.05[aout]");
-        }
-        // If no audio and no bg music, video will have no audio track
-      }
-
-      command = ffmpeg(videoPath);
-
-      // Now that command is created, set up the timeout
-      processingTimeout = setTimeout(() => {
-        console.error(`❌ Video processing timeout for session ${sessionId}`);
-        try {
-          if (command) command.kill("SIGKILL");
-        } catch (e) {
-          console.error(`Failed to kill FFmpeg process: ${e.message}`);
-        }
-        // Clean up partial output file
-        if (fs.existsSync(cleanedPath)) {
-          try {
-            fs.unlinkSync(cleanedPath);
-          } catch (e) {}
-        }
-        resolve(videoPath); // Fallback to original
-      }, 300000); // 5 minute timeout
-
-      // Add background music as input if available
-      if (hasBgMusic) {
-        command.input(bgMusicPath); // Don't loop - will be handled by amix duration
-      }
-
-      const outputOptions = [
-        // Map the processed video
-        "-map",
-        "[vout]",
-
-        // Strip ALL existing metadata completely
-        "-map_metadata",
-        "-1",
-        "-map_metadata:s:v",
-        "-1",
-        "-map_metadata:s:a",
-        "-1",
-
-        // Video encoding settings (optimized for speed)
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast", // Changed to ultrafast for maximum speed
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p", // Ensure compatibility
-        "-tune",
-        "fastdecode", // Optimize for fast decoding
-
-        // Remove all flags and timestamps
-        "-fflags",
-        "+bitexact",
-        "-avoid_negative_ts",
-        "make_zero",
-      ];
-
-      // Only map audio if we have an audio output
-      if (hasAudio || hasBgMusic) {
-        outputOptions.unshift("-map", "[aout]");
-        outputOptions.push("-c:a", "aac", "-b:a", "192k");
-
-        // If using background music without original audio, ensure it stops at video end
-        if (!hasAudio && hasBgMusic) {
-          outputOptions.push("-shortest");
-        }
-      }
-
-      let logged100 = false; // Track if we've logged 100% already
-
-      command
-        .complexFilter(filterComplex.join(";"))
-        .outputOptions(outputOptions)
-        .output(cleanedPath)
-        .on("start", (cmd) => {
-          console.log(`🎬 FFmpeg started for session: ${sessionId}`);
-        })
-        .on("stderr", (stderrLine) => {
-          // Log important FFmpeg messages
-          if (stderrLine.includes("error") || stderrLine.includes("Error")) {
-            console.error(`FFmpeg: ${stderrLine}`);
-          }
-        })
-        .on("progress", (progress) => {
-          // Cap progress at 100% and only show every 10%
-          if (progress.percent) {
-            const cappedPercent = Math.min(Math.round(progress.percent), 100);
-            // Only log at 10% intervals to reduce spam, and only log 100% once
-            if (cappedPercent % 10 === 0 && cappedPercent < 100) {
-              console.log(`⏳ Processing: ${cappedPercent}%`);
-            } else if (cappedPercent === 100 && !logged100) {
-              logged100 = true;
-              console.log(`⏳ Processing: 100% - Finalizing output file...`);
-            }
-          } else if (progress.timemark) {
-            // Show timemark if percent not available
-            console.log(`⏳ Processing: ${progress.timemark}`);
-          }
-        })
-        .on("end", () => {
-          clearTimeout(processingTimeout);
-          console.log(
-            `✅ Video processed successfully for session: ${sessionId}`,
-          );
-          console.log(`   - Sped up to 1.1x ✓`);
-          console.log(`   - White overlay 2% opacity ✓`);
-          console.log(
-            `   - Background music ${
-              hasBgMusic ? "5% volume ✓" : "skipped (no file)"
-            }`,
-          );
-          console.log(`   - Metadata stripped ✓`);
-          resolve(cleanedPath);
-        })
-        .on("error", (err) => {
-          clearTimeout(processingTimeout);
-          console.error(
-            `❌ Video processing failed for session ${sessionId}:`,
-            err.message,
-          );
-          console.log(`⚠️ Using original video for session: ${sessionId}`);
-
-          // Clean up partial output file on error
-          if (fs.existsSync(cleanedPath)) {
-            try {
-              fs.unlinkSync(cleanedPath);
-              console.log(`🧹 Cleaned up partial file: ${cleanedPath}`);
-            } catch (e) {
-              console.error(`Failed to clean up partial file: ${e.message}`);
-            }
-          }
-
-          // Fallback to original if processing fails
-          resolve(videoPath);
-        })
-        .run();
-    });
-  });
-}
-
-async function processVideo(videoPath, sessionId) {
-  return new Promise((resolve, reject) => {
-    const editedPath = path.join(
-      __dirname,
-      "videos",
-      `edited_reel_${sessionId}.mp4`,
-    );
-
-    console.log(`Starting video processing for session: ${sessionId}`);
-
-    ffmpeg.ffprobe(videoPath, (err, metadata) => {
-      if (err)
-        return reject(
-          new Error(
-            `Failed to probe video for session ${sessionId}: ` + err.message,
-          ),
-        );
-
-      const videoStream = metadata.streams.find(
-        (s) => s.codec_type === "video",
-      );
-      if (!videoStream) return reject(new Error("No video stream found"));
-
-      const hasAudio = metadata.streams.some((s) => s.codec_type === "audio");
-      const duration = parseFloat(metadata.format.duration);
-
-      const width = videoStream.width;
-      const height = videoStream.height;
-
-      const targetWidth = 1080;
-      const targetHeight = 1920;
-
-      const videoAspect = width / height;
-      const targetAspect = 9 / 16;
-
-      let scaleFilter, padFilter;
-
-      if (videoAspect > targetAspect) {
-        const newWidth = targetWidth;
-        const newHeight = Math.floor(targetWidth / videoAspect);
-        const paddingTop = Math.floor((targetHeight - newHeight) / 2);
-        const paddingBottom = targetHeight - newHeight - paddingTop;
-
-        scaleFilter = `scale=${newWidth}:${newHeight}`;
-        padFilter = `pad=${targetWidth}:${targetHeight}:0:${paddingTop}:black`;
-      } else {
-        const newHeight = targetHeight;
-        const newWidth = Math.floor(targetHeight * videoAspect);
-        const paddingLeft = Math.floor((targetWidth - newWidth) / 2);
-        const paddingRight = targetWidth - newWidth - paddingLeft;
-
-        scaleFilter = `scale=${newWidth}:${newHeight}`;
-        padFilter = `pad=${targetWidth}:${targetHeight}:${paddingLeft}:0:black`;
-      }
-
-      const now = new Date();
-      const kstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-      const kstTimeStr = kstTime.toISOString().replace(/\.\d+Z$/, "");
-
-      const SEO_CITIES = [
-        {
-          name: "Seoul, South Korea",
-          lat: 37.5665,
-          lng: 126.978,
-          address: "South Korea",
-        },
-      ];
-
-      const selectedCity = SEO_CITIES[0];
-
-      const trimDuration = (Math.random() * 0.02 + 0.05).toFixed(2);
-      const endTrimDuration = (Math.random() * 0.02 + 0.05).toFixed(2);
-      const baseDuration =
-        duration - parseFloat(trimDuration) - parseFloat(endTrimDuration);
-      const outputDuration = baseDuration;
-
-      const contrast = (Math.random() * 0.08 + 1.05).toFixed(3);
-      const brightness = (Math.random() * 0.02 - 0.01).toFixed(3);
-      const saturation = (Math.random() * 0.1 + 1.05).toFixed(3);
-      const gamma = (Math.random() * 0.05 + 0.98).toFixed(3);
-
-      const frameRate = (29.8 + Math.random() * 0.2).toFixed(2);
-
-      const videoBitrate = `${Math.floor(8000 + Math.random() * 2000)}k`;
-      const audioBitrate = `${Math.floor(256 + Math.random() * 64)}k`;
-
-      let videoFilters = [];
-      videoFilters.push(scaleFilter);
-      videoFilters.push(
-        `eq=contrast=${contrast}:brightness=${brightness}:saturation=${saturation}:gamma=${gamma}`,
-      );
-      videoFilters.push(`unsharp=5:5:0.8:3:3:0.4`);
-      videoFilters.push(`hqdn3d=4:3:6:4.5`);
-      videoFilters.push(`colorbalance=rs=0.1:gs=0.05:bs=-0.05`);
-      videoFilters.push(`fps=${frameRate}`);
-
-      const finalFilter = `[padded]copy[final]`;
-
-      const command = ffmpeg(videoPath)
-        .inputOptions([`-ss ${trimDuration}`])
-        .complexFilter(
-          [
-            `[0:v]${videoFilters.join(",")}[scaled]`,
-            `[scaled]${padFilter}[padded]`,
-            finalFilter,
-          ],
-          "final",
-        )
-        .outputOptions([
-          "-t",
-          outputDuration.toFixed(2),
-          "-c:v",
-          "libx264",
-          "-c:a",
-          "aac",
-          `-b:v`,
-          `${videoBitrate}`,
-          `-b:a`,
-          `${audioBitrate}`,
-          "-maxrate",
-          `${Math.floor(parseInt(videoBitrate) * 1.8)}k`, // Higher maxrate for quality
-          "-bufsize",
-          `${Math.floor(parseInt(videoBitrate) * 3)}k`, // Larger buffer for quality
-          "-crf",
-          "15", // Ultra high quality (lower CRF)
-          "-preset",
-          "veryslow", // Best quality preset
-          "-profile:v",
-          "high",
-          "-level:v",
-          "4.2",
-          "-pix_fmt",
-          "yuv420p",
-          "-threads",
-          "0", // Use all available cores
-          "-movflags",
-          "+faststart",
-          "-g",
-          "48", // Smaller GOP for better quality
-          "-keyint_min",
-          "24",
-          "-sc_threshold",
-          "0",
-          "-tune",
-          "film", // Optimize for high quality content
-          "-x264opts",
-          "ref=4:bframes=4:b-adapt=2:direct=auto:me=umh:subme=8:analyse=all:8x8dct=1:trellis=2:fast-pskip=0:mixed-refs=1",
-          // Keep metadata changes for anti-detection
-          "-metadata",
-          `title=K-drama/K-pop | idolchat.app`,
-          "-metadata",
-          `comment=Content | Powered by idolchat.app`,
-          "-metadata",
-          `location=${selectedCity.name}`,
-          "-metadata",
-          `creation_time=${kstTimeStr}`,
-          "-metadata",
-          `latitude=${selectedCity.lat}`,
-          "-metadata",
-          `longitude=${selectedCity.lng}`,
-          "-metadata",
-          `location-eng=${selectedCity.name}`,
-          "-metadata",
-          `copyright=idolchat.app`,
-        ]);
-
-      if (hasAudio) {
-        // High-quality audio processing with enhancement filters
-        command
-          .audioFilter(
-            "highpass=f=80,lowpass=f=18000,dynaudnorm=g=3,acompressor=threshold=0.1:ratio=2:attack=5:release=50,equalizer=f=3000:width=1000:g=1",
-          )
-          .outputOptions([
-            "-map",
-            "0:a?",
-            "-ar",
-            "48000", // High sample rate
-            "-ac",
-            "2", // Stereo
-            "-b:a",
-            "320k", // High quality audio bitrate
-            "-acodec",
-            "aac",
-          ]);
-      }
-
-      command
-        .output(editedPath)
-        .on("end", () => {
-          console.log(
-            `Video processing completed successfully for session: ${sessionId}`,
-          );
-          resolve(editedPath);
-        })
-        .on("error", (err) => {
-          console.error(
-            `Video processing failed for session ${sessionId}:`,
-            err.message,
-          );
-          reject(
-            new Error(
-              `Failed to process video for session ${sessionId}: `.concat(
-                err.message,
-              ),
-            ),
-          );
         })
         .run();
     });

@@ -136,7 +136,7 @@ const FILE_LIMITS = {
   INSTAGRAM_CAPTION_MAX: 2200, // Instagram caption character limit
 };
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   // Auto-refresh Instagram tokens on startup
@@ -168,9 +168,14 @@ async function autoRefreshInstagramTokens() {
       const timeSinceRefresh = Date.now() - lastRefresh;
 
       if (timeSinceRefresh < REFRESH_COOLDOWN) {
-        const minutesAgo = Math.floor(timeSinceRefresh / 60000);
+        const secondsAgo = Math.floor(timeSinceRefresh / 1000);
+        const minutesAgo = Math.floor(secondsAgo / 60);
+        const displayTime =
+          minutesAgo > 0
+            ? `${minutesAgo} minute(s) ago`
+            : `${secondsAgo} second(s) ago`;
         console.log(
-          `⏭️  Skipping token refresh (last refreshed ${minutesAgo} minute(s) ago)\n`,
+          `⏭️  Skipping token refresh (last refreshed ${displayTime})\n`,
         );
         return;
       }

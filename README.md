@@ -6,7 +6,7 @@ A Discord bot that automatically downloads Instagram reels, processes them with 
 
 - 🎬 Download Instagram reels via Discord commands
 - 🎨 Add Netflix-style text overlays with fade effects
-- 🤖 AI-powered captions using Google Gemini (unique for every post!)
+- 🤖 AI-powered captions using Google Gemini (unique for every post)
 - 📤 Upload to multiple Instagram accounts simultaneously
 - 📺 Upload to YouTube channels (optional)
 - 🔄 Automatic retry logic with exponential backoff

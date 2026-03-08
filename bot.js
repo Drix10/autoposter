@@ -83,7 +83,7 @@ const client = new Client({
 });
 
 const activeSessions = new Set();
-const MAX_CONCURRENT_SESSIONS = 3;
+const MAX_CONCURRENT_SESSIONS = 5;
 
 const RETRY_CONFIG = {
   maxRetries: 3,
